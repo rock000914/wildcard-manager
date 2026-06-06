@@ -1963,11 +1963,11 @@ class MainWindow(QMainWindow):
             return
         self.folder_tree.setCurrentItem(item)
         menu = QMenu(self)
-        open_action = menu.addAction("繧ｨ繧ｯ繧ｹ繝励Ο繝ｼ繝ｩ繝ｼ縺ｧ髢九￥")
+        open_action = menu.addAction("エクスプローラーで開く")
         folder_key = item.data(0, Qt.UserRole) or ""
         delete_action = None
         if folder_key:
-            delete_action = menu.addAction("縺薙・繝輔か繝ｫ繝繧貞炎髯､")
+            delete_action = menu.addAction("このフォルダを削除")
         chosen = menu.exec(self.folder_tree.viewport().mapToGlobal(pos))
         if chosen is None:
             return
@@ -1981,15 +1981,15 @@ class MainWindow(QMainWindow):
         if target.exists():
             subprocess.Popen(["explorer.exe", str(target)])
         else:
-            self._show_info("繝輔か繝ｫ繝", f"繝輔か繝ｫ繝縺瑚ｦ九▽縺九ｊ縺ｾ縺帙ｓ:\n{target}")
+            self._show_info("フォルダ", f"フォルダが見つかりません:\n{target}")
 
     def _delete_folder_from_tree(self, folder_key: str) -> None:
         if not folder_key:
             self._show_info("フォルダ削除", "保存先ルートは削除できません。")
             return
         result = self._ask_yes_no(
-            "繝輔か繝ｫ繝蜑企勁",
-            f"Delete the following folder?\n\n{folder_key}\n\nAll wildcard and thumbnail files under it will also be deleted. Continue?",
+            "フォルダ削除",
+            f"以下のフォルダを削除しますか？\n\n{folder_key}\n\n配下の wildcard と thumbnail もすべて削除されます。",
             default_button=QMessageBox.No,
         )
         if result != QMessageBox.Yes:
@@ -1999,7 +1999,7 @@ class MainWindow(QMainWindow):
             self.current_folder_prefix = ""
             self.rescan_library()
             self.statusBar().showMessage(
-                f"繝輔か繝ｫ繝繧貞炎髯､縺励∪縺励◆: wildcard={stats['wildcards']} thumbnail={stats['thumbnails']}",
+                f"フォルダを削除しました: wildcard={stats['wildcards']} thumbnail={stats['thumbnails']}",
                 6000,
             )
         except Exception as exc:
@@ -2165,14 +2165,14 @@ class MainWindow(QMainWindow):
             return
 
         menu = QMenu(self)
-        copy_all_action = menu.addAction("蜈ｨ譁・さ繝斐・ LoRA縺ゅｊ")
+        copy_all_action = menu.addAction("全文コピー LoRAあり")
         copy_all_without_action = menu.addAction("全文コピー LoRAなし")
         thumb_action = menu.addAction("サムネ生成")
         menu.addSeparator()
-        import_copy_action = menu.addAction("縺薙・鬆・岼繧貞・繝・・繧ｿ縺九ｉ繧ｳ繝斐・蜿悶ｊ霎ｼ縺ｿ")
-        import_move_action = menu.addAction("縺薙・鬆・岼繧貞・繝・・繧ｿ縺九ｉ繝繝ｼ繝門叙繧願ｾｼ縺ｿ")
+        import_copy_action = menu.addAction("この項目をコピー取り込み")
+        import_move_action = menu.addAction("この項目を移動取り込み")
         if self.current_entry.lora_names:
-            search_menu = menu.addMenu("LoRA 縺ｧ邨槭ｊ霎ｼ縺ｿ")
+            search_menu = menu.addMenu("LoRA で絞り込み")
             for name in self.current_entry.lora_names:
                 action = search_menu.addAction(name)
                 action.triggered.connect(lambda checked=False, n=name: self.search_edit.setText(f"lora:{n}"))
@@ -2194,7 +2194,7 @@ class MainWindow(QMainWindow):
         if not item:
             return
         menu = QMenu(self)
-        filter_action = menu.addAction("縺薙・ LoRA 縺ｧ讀懃ｴ｢")
+        filter_action = menu.addAction("この LoRA で検索")
         action = menu.exec(self.lora_list.viewport().mapToGlobal(pos))
         if action == filter_action:
             self.search_edit.setText(f"lora:{item.text()}")
@@ -2217,7 +2217,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("保存しました", 4000)
             return True
         except Exception as exc:
-            self._show_error("菫晏ｭ倥お繝ｩ繝ｼ", str(exc))
+            self._show_error("保存エラー", str(exc))
             return False
 
     def _replace_entry(self, updated: WildcardEntry) -> None:
@@ -2280,12 +2280,12 @@ class MainWindow(QMainWindow):
     def _on_thumbnail_generation_finished(self, updated: WildcardEntry, filename: str) -> None:
         self._stop_thumbnail_loading_feedback()
         self._replace_entry(updated)
-        self.statusBar().showMessage(f"繧ｵ繝繝阪う繝ｫ繧堤函謌舌＠縺ｾ縺励◆: {filename}", 5000)
+        self.statusBar().showMessage(f"サムネイルを生成しました: {filename}", 5000)
         self._cleanup_thumbnail_generation_worker()
 
     def _on_thumbnail_generation_failed(self, message: str) -> None:
         self._stop_thumbnail_loading_feedback()
-        self._show_error("繧ｵ繝繝咲函謌舌お繝ｩ繝ｼ", message)
+        self._show_error("サムネイル生成エラー", message)
         if self.current_entry is not None:
             self._show_entry(self.current_entry)
         self._cleanup_thumbnail_generation_worker()
@@ -2307,16 +2307,17 @@ class MainWindow(QMainWindow):
         if not inspection["configured_exists"] and not inspection["existing_roots"]:
             self._show_warning(
                 title,
-                "遘ｻ陦悟・ thumbnail 繝ｫ繝ｼ繝医′隕九▽縺九ｊ縺ｾ縺帙ｓ縲・n"
-                "wildcard 譛ｬ譁・・遘ｻ陦後〒縺阪∪縺吶′縲√し繝繝阪う繝ｫ縺ｯ遘ｻ陦後＆繧後∪縺帙ｓ縲・n\n"
-                f"蜈･蜉帛､:\n{inspection['configured_root']}",
+                "設定されたサムネイル取込元ルートが見つかりません。\n"
+                "wildcard 本体は取り込みできますが、サムネイルは取り込まれません。\n\n"
+                f"設定値:\n{inspection['configured_root']}",
             )
         elif not inspection["configured_exists"] and inspection["existing_roots"]:
             self._show_info(
                 title,
-                "遘ｻ陦悟・ thumbnail 繝ｫ繝ｼ繝医・蜈･蜉帛､縺ｯ隕九▽縺九ｊ縺ｾ縺帙ｓ縺ｧ縺励◆縺後∬｣懈ｭ｣蛟呵｣懊ｒ菴ｿ縺｣縺ｦ邯夊｡後＠縺ｾ縺吶・n\n"
-                f"蜈･蜉帛､:\n{inspection['configured_root']}\n\n"
-                f"菴ｿ逕ｨ蛟呵｣・\n{inspection['existing_roots'][0]}",
+                "設定されたサムネイル取込元ルートは見つかりませんでしたが、\n"
+                "代わりに使えそうな場所があります。\n\n"
+                f"設定値:\n{inspection['configured_root']}\n\n"
+                f"使用候補:\n{inspection['existing_roots'][0]}",
             )
         if self._ask_yes_no(title, message) != QMessageBox.Yes:
             return
@@ -2331,7 +2332,7 @@ class MainWindow(QMainWindow):
             )
             self.rescan_library()
             self.statusBar().showMessage(
-                f"{title} 螳御ｺ・ wildcard={stats['imported']} thumbnail={stats['thumbnails']} skipped={stats['skipped']}",
+                f"{title} 取り込み完了 wildcard={stats['imported']} thumbnail={stats['thumbnails']} skipped={stats['skipped']}",
                 6000,
             )
             if stats["thumbnail_source_roots"] == 0:
@@ -2367,7 +2368,7 @@ class MainWindow(QMainWindow):
             )
             self.rescan_library()
             self.statusBar().showMessage(
-                f"{title} 螳御ｺ・ wildcard={stats['imported']} thumbnail={stats['thumbnails']} skipped={stats['skipped']}",
+                f"{title} 取り込み完了 wildcard={stats['imported']} thumbnail={stats['thumbnails']} skipped={stats['skipped']}",
                 6000,
             )
         except Exception as exc:
