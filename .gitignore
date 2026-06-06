@@ -1,0 +1,30 @@
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Local app state and data
+config.json
+ui_state.json
+wildcard_manager.db
+library/
+
+# Temporary test fixtures
+_tmp_test/
+_ui_test/
+
+# Build / environment folders
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+
+# Recovery / backup files
+*.broken_*
+*.codex_broken_*
+wildcard_manager/main_window_recovered_from_pyc.py
+wildcard_manager/main_window_restored.py
+wildcard_manager/main_window_restored_310.py
+*.bak
+*.tmp
