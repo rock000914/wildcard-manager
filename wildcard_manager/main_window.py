@@ -691,17 +691,6 @@ class SettingsDialog(QDialog):
         self.generation_steps = QLineEdit(str(settings.generation_steps))
         self.generation_cfg_scale = QLineEdit(str(settings.generation_cfg_scale))
         self.generation_sampler_name = QLineEdit(settings.generation_sampler_name)
-        self.generation_checkpoint_name = QComboBox()
-        self.generation_checkpoint_name.setEditable(True)
-        self.generation_checkpoint_name.setInsertPolicy(QComboBox.NoInsert)
-        self.generation_checkpoint_name.setMinimumContentsLength(32)
-        self.generation_checkpoint_name.addItem(settings.generation_checkpoint_name or "")
-        self.generation_checkpoint_name.setCurrentText(settings.generation_checkpoint_name)
-        self.refresh_checkpoints_button = QPushButton("候補更新")
-        self.refresh_checkpoints_button.clicked.connect(self._refresh_checkpoint_list)
-        self.checkpoint_status = QLabel("API から候補を取得できます")
-        self.checkpoint_status.setWordWrap(True)
-        self.checkpoint_status.setStyleSheet("color: #e7b65c;")
         self.generation_extra_payload_json = QPlainTextEdit(settings.generation_extra_payload_json)
         self.generation_extra_payload_json.setMinimumHeight(140)
         self.thumbnail_size = QLineEdit(str(settings.thumbnail_size))
@@ -740,14 +729,6 @@ class SettingsDialog(QDialog):
         generation_form.addRow("ステップ数", self.generation_steps)
         generation_form.addRow("CFG", self.generation_cfg_scale)
         generation_form.addRow("サンプラー", self.generation_sampler_name)
-        checkpoint_row = QWidget()
-        checkpoint_layout = QHBoxLayout(checkpoint_row)
-        checkpoint_layout.setContentsMargins(0, 0, 0, 0)
-        checkpoint_layout.setSpacing(8)
-        checkpoint_layout.addWidget(self.generation_checkpoint_name, 1)
-        checkpoint_layout.addWidget(self.refresh_checkpoints_button, 0)
-        generation_form.addRow("checkpoint", checkpoint_row)
-        generation_form.addRow("", self.checkpoint_status)
         generation_form.addRow("生成 payload JSON", self.generation_extra_payload_json)
         tabs.addTab(generation_tab, "生成")
 
@@ -835,38 +816,10 @@ class SettingsDialog(QDialog):
             generation_steps=int(self.generation_steps.text().strip() or 20),
             generation_cfg_scale=float(self.generation_cfg_scale.text().strip() or 7.0),
             generation_sampler_name=self.generation_sampler_name.text().strip(),
-            generation_checkpoint_name=self.generation_checkpoint_name.currentText().strip(),
             generation_extra_payload_json=self.generation_extra_payload_json.toPlainText().strip() or "{}",
             include_lora_on_copy=True,
             thumbnail_size=int(self.thumbnail_size.text().strip() or 260),
         )
-
-    def _refresh_checkpoint_list(self) -> None:
-        current = self.generation_checkpoint_name.currentText().strip()
-        try:
-            checkpoints = self.api.list_checkpoints(self._candidate_settings())
-        except Exception as exc:
-            self.checkpoint_status.setStyleSheet("color: #ef8d8d;")
-            self.checkpoint_status.setText(f"候補一覧を取得できません: {exc}")
-            return
-
-        self.generation_checkpoint_name.blockSignals(True)
-        try:
-            self.generation_checkpoint_name.clear()
-            self.generation_checkpoint_name.addItem("")
-            for checkpoint in checkpoints:
-                self.generation_checkpoint_name.addItem(checkpoint)
-            if current and current not in checkpoints:
-                self.generation_checkpoint_name.addItem(current)
-            self.generation_checkpoint_name.setCurrentText(current)
-            if checkpoints:
-                self.checkpoint_status.setStyleSheet("color: #7fd48e;")
-                self.checkpoint_status.setText(f"{len(checkpoints)} 件の checkpoint 候補を取得しました")
-            else:
-                self.checkpoint_status.setStyleSheet("color: #e7b65c;")
-                self.checkpoint_status.setText("checkpoint 候補が見つかりませんでした")
-        finally:
-            self.generation_checkpoint_name.blockSignals(False)
 
     def _refresh_source_thumbnail_status(self) -> None:
         try:
@@ -913,7 +866,6 @@ class SettingsDialog(QDialog):
             generation_steps=int(self.generation_steps.text().strip() or base_settings.generation_steps),
             generation_cfg_scale=float(self.generation_cfg_scale.text().strip() or base_settings.generation_cfg_scale),
             generation_sampler_name=self.generation_sampler_name.text().strip(),
-            generation_checkpoint_name=self.generation_checkpoint_name.currentText().strip(),
             generation_extra_payload_json=self.generation_extra_payload_json.toPlainText().strip() or "{}",
             include_lora_on_copy=base_settings.include_lora_on_copy,
             thumbnail_size=int(self.thumbnail_size.text().strip() or base_settings.thumbnail_size),
