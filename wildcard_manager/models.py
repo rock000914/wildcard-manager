@@ -19,6 +19,7 @@ class AppSettings:
     generation_steps: int = 20
     generation_cfg_scale: float = 7.0
     generation_sampler_name: str = "Euler a"
+    generation_checkpoint_name: str = ""
     generation_extra_payload_json: str = "{}"
     include_lora_on_copy: bool = True
     thumbnail_size: int = 260
