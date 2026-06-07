@@ -1,6 +1,6 @@
 # Wildcard Manager
 
-PySide6 で作った、独立運用向けの wildcard manager です。
+PySide6 で作った、Stable Diffusion に最適な wildcard 管理ツールです。wildcard の整理、検索、コピー、サムネ生成までひとつにまとめて、相性のいい運用を快適にします。
 
 ## できること
 
@@ -10,13 +10,13 @@ PySide6 で作った、独立運用向けの wildcard manager です。
   - ファイル名
   - 本文
   - カスタムタグ
-  - LoRA 名 (`lora:cock_to_clean` のように検索)
-- 右クリックや LoRA 一覧から同じ LoRA を使う wildcard を絞り込み
+  - LoRA 名
+- 右クリックや LoRA 一覧から、同じ LoRA を使う wildcard を絞り込み
 - コピー時に LoRA タグを含める / 外すを切り替え
-- 既存 `sd-dynamic-prompts` / `wildcard-gallery` から独立ライブラリへコピーまたはムーブ
+- 既存の `sd-dynamic-prompts` / `wildcard-gallery` から独立ライブラリへコピーまたは移動
 - サムネイル表示
-- サムネイルがない wildcard に対して StabilityMatrix / Forge 系 `sdapi` で生成し、`.webp` 保存
-- wildcard 本文とは別に検索用のカスタムタグを保存
+- サムネイルがない wildcard に対して StabilityMatrix / Forge 系 `sdapi` で生成して `.webp` 保存
+- wildcard 本文とは別に、検索用のカスタムタグを保存
 
 ## 保存の考え方
 
