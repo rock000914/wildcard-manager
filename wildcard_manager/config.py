@@ -22,7 +22,7 @@ class SettingsStore:
             data = json.load(handle)
 
         defaults = asdict(AppSettings.default(self.app_dir))
-        defaults.update(data)
+        defaults.update({k: v for k, v in data.items() if k in defaults})
         settings = AppSettings(**defaults)
         return self._normalize_portable_paths(settings)
 
@@ -77,6 +77,8 @@ class UIStateStore:
             "detail_splitter_sizes": settings.detail_splitter_sizes,
             "last_folder": settings.last_folder,
             "sort_mode": settings.sort_mode,
+            "sort_key": settings.sort_key,
+            "sort_order": settings.sort_order,
             "thumbnail_size": settings.thumbnail_size,
         }
         with self.path.open("w", encoding="utf-8") as handle:
