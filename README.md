@@ -93,27 +93,96 @@ python app.py
 | `wildcard_manager/single_thumbnail_worker.py` | 個別サムネイル生成ワーカー |
 | `wildcard_manager/ui_utils.py` | ファイルマネージャー操作・コンテキストメニュー共通化 |
 
-## 主な改善点（v2）
+## 更新履歴
 
-### バグ修正
-- コンテキストメニューの「削除」が入力フィールド自体を消すバグを修正
-- 数値入力が不正な場合の `ValueError` クラッシュを防止
-- API 接続テストでプロキシの HTML 応答を誤検出しないよう検証強化
-- ファイル上書き時のデータロスト风险を排除（`unlink` → `move` 順序の修正）
-- パストラバーサルによるライブラリ外への脱出を防止
+### v2.0 (2026-06-24) - 大規模改善リリース
 
-### パフォーマンス
-- サムネイルの存在確認を `exists()` 単発呼び出し → 事前ビルド `set` の O(1) ルックアップに変更
-- `scan_library` を `rglob` + `sorted` → `os.walk` 単一パスに変更
-- SQLite の `PRAGMA` を永続化（毎回発行しない）
-- `dir_mtimes.json` のデッドコードを削除
-- 不足サムネイルの一括生成を `QThread` バックグラウンド化（UI フリーズ解消）
-- API 監視周期を 3秒 → 5秒に延長
+外部レビューに基づくバグ修正・パフォーマンス改善・アーキテクチャ刷新。
 
-### アーキテクチャ
-- `main_window.py` からサムネイル関連を独立モジュールに分離
-- ファイルマネージャー操作・右クリックメニューを `ui_utils.py` に共通化
-- `rel_path` に UNIQUE 制約を導入し、重複行を自動解消
+#### バグ修正
+- **コンテキストメニューの deleteLater バグ**: 右クリック→削除 で入力フィールド自体が消える重大バグを修正。`ui_utils.py` に委譲
+- **数値パースのクラッシュ防止**: `int()` / `float()` の直接呼び出しを `_parse_int` / `_parse_float` ヘルパに置き換え。不正入力でも `ValueError` にならない
+- **API 応答の誤検出防止**: プロキシや認証ページの HTML 応答（200 OK）を成功扱いしないよう、Content-Type が JSON かを追加検証
+- **ファイル上書き時のデータロスト防止**: `unlink` → `move` の順序を廃止。`shutil.move` / `copy2` が直接上書きするように変更
+- **パストラバーサル防止**: `move_entry` / `delete_folder` で `resolve()` 後に `library_root` 配下か検証。`../../etc` でライブラリ外へ脱出する問題を解消
+- **LoRA タグ除去の正規化**: `.replace("  ", " ")` → `re.sub(r"\s+", " ", ...)` に変更。3連続スペースを正しく1つに潰す
+- **LoRA 順序の保持**: `set` + `sorted` → `dict.fromkeys` で実出現順を保持
+- **API 監視の未知 state 対応**: `_LAMP_COLORS.get(state, ...)` でフォールバック。未知の状態でも `KeyError` にならない
+- **PathLabel の初期化保証**: 防衛的 `getattr` を削除。`_build_ui` で確実に初期化されるため直接アクセスに変更
+- **dead code 削除**: `_pending_preview_request` / `_pending_content_abs_path` は書き込まれるだけで読み出されない変数だったため削除
+- **Painter save/restore の整合**: `restore()` 呼び出し前に `save()` を追加。Qt の警告を防止
+- **サムネイル反映の即時化**: 新規作成ダイアログで生成したサムネイルを `refresh_entry` で即座に DB に反映
+- **サムネイルの重複生成防止**: 事前生成済みサムネイルをコピーする前に `dest.exists()` チェックを追加
+
+#### パフォーマンス改善
+- **サムネイル存在確認の O(1) 化**: 1ファイルずつの `exists()` → 事前ビルドした `set` でルックアップ。5,000 ファイルのライブラリで劇的改善
+- **scan_library の単一パス化**: `rglob` + `sorted` → `os.walk` で1回の走査に。メモリ使用量も削減
+- **SQLite PRAGMA の永続化**: `journal_mode=WAL` を毎回発行していたのを初回のみに。接続ごとのオーバーヘッド削減
+- **PRAGMA 追加**: `synchronous=NORMAL` / `temp_store=MEMORY` / `cache_size=-2000` で書き込み速度とキャッシュ効率改善
+- **dir_mtimes.json のデッドコード削除**: スキップ判定が `pass` だったため実質無効。毎回の二重ディレクトリ走査が不要に
+- **不足サムネイル一括生成の QThread 化**: `processEvents()` ループを廃止。UI フリーズが解消
+- **API 監視周期の延長**: 3秒 → 5秒。アイドル時の通信負荷軽減
+- **コンテンツキャッシュの LRU 化**: `dict` → `OrderedDict`（上限 500 エントリ）。大規模ライブラリでのメモリ膨張を抑制
+- **load_entries の最適化**: `SELECT *` → 必要カラムのみ。Python 側ソート → SQL で `GROUP BY` + `ORDER BY`
+- **scan_profile.log のサイズ制限**: 1 MiB 超過時に古いエントリを切り詰め。ログの無限膨張を防止
+
+#### アーキテクチャ改善
+- **モジュール分離**: `main_window.py`（2,469行）から以下を独立モジュールに分離
+  - `thumbnail_model.py`（422行）: サムネイル一覧のモデルとデリゲート
+  - `thumbnail_workers.py`（151行）: サムネイル読込ワーカー
+  - `tag_editor.py`（405行）: タグエディットウィジェット
+  - `new_wildcard_dialog.py`（1,828行）: 新規ワイルドカード作成ダイアログ
+  - `ui_utils.py`（116行）: ファイルマネージャー操作・コンテキストメニュー共通化
+- **rel_path の UNIQUE 制約**: 重複行の自動解消。移行時に古い行を削除してから再作成
+- **DB エントリ数の確認メソッド追加**: `db_entry_count()` / `count_txt_files_on_disk()` で整合性チェックが可能に
+
+#### 機能追加
+- **ランダム wildcard 組み合わせ**: サムネイル生成時に指定フォルダからランダムに wildcard を1つ選んでプロンプトに追加
+- **ADetailer 対応**: `generation_adetailer_enabled` が True のとき `alwayson_scripts` に ADetailer を追加
+- **API チェックポイント一覧取得**: `list_checkpoints()` で sd-webui のモデル一覧を取得
+- **API 生成状態監視**: `check_progress()` / `is_generating()` でリアルタイムに進捗を確認
+- **不足サムネイルのバッチ生成**: `MissingThumbnailBatchWorker` でバックグラウンド逐次生成。進捗表示・キャンセル対応
+- **新規ワイルドカードダイアログの動的タブ**: 「+」ボタンでカスタムタブを追加可能。ダブルクリックでリネーム、右クリックで削除
+- **設定の永続化拡張**: `sort_key` / `sort_order` を `ui_state.json` に保存
+- **ハードコードパスの除去**: 開発者個人の `H:\StabilityMatrix\...` をデフォルトから削除。初回起動時にユーザーが設定
+
+#### セキュリティ
+- **パス検証の強化**: `move_entry` / `delete_folder` で `resolve()` 後に親ディレクトリ参照を検証
+- **ファイル上書きの安全化**: `unlink` を廃止し、`shutil.move` / `copy2` の直接上書きに変更。失敗時は例外が上がり、source は失われない
+
+---
+
+### v1.x - 初期リリース
+
+#### 機能
+- wildcard の読み込み・編集・保存
+- フォルダツリーでの絞り込み
+- 検索（ファイル名・本文・カスタムタグ・LoRA 名）
+- サムネイル表示・生成
+- `sd-dynamic-prompts` / `wildcard-gallery` からのコピー・ムーブ
+- カスタムタグ（`.wcm.json`）
+
+#### 既知の問題（v2 で修正済み）
+- コンテキストメニューの「削除」が入力フィールド自体を消す
+- 不正な数値入力で `ValueError` クラッシュ
+- API 接続テストでプロキシの HTML を成功扱い
+- ファイル上書き時に `unlink` → `move` の順序でデータロスト风险
+- パストラバーサルでライブラリ外へ脱出可能
+- サムネイルの存在確認が遅い（大規模ライブラリ）
+- 不足サムネイルの一括生成で UI フリーズ
+
+---
+
+## 今後の予定
+
+- [ ] テストの実装
+- [ ] `QAbstractTableModel + QTableView` への移行（大規模一覧のさらなる高速化）
+- [ ] ドラッグ&ドロップ対応
+- [ ] wildcard のバッチリネーム
+- [ ] 複数 API エンドポイントの同時監視
+- [ ] サムネイルの自動生成ルール（条件付き）
+- [ ] ダーク/ライトテーマ切り替え
+- [ ] エクスポート機能（CSV / JSON）
 
 ## 既知の制限
 
