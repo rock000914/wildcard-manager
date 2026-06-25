@@ -152,6 +152,28 @@ python app.py
 
 ---
 
+### v2.1 (2026-06-26) - Windows安定性強化 + サムネイル即時反映
+
+#### バグ修正
+- **WinError 6（ハンドルが無効です）対策**: `Path.resolve()` が Windows 環境で `OSError` を投げる問題に対し、`_safe_resolve()` / `_safe_resolve_path()` ラッパーを導入。`repository.py` / `api.py` / `ui_utils.py` の全 `resolve()` 呼び出しを保護
+- **open_in_file_manager() のハンドル漏洩修正**: `subprocess.Popen` に `close_fds=True` + `DEVNULL` ハンドル + `STARTUPINFO` を追加。不要なハンドルの継承を防止
+- **サムネイル生成後のカード更新不良修正**: 生成完了後、非同期パイプラインを待たずに `set_icon_directly()` で同步的にキャッシュへ格納。即座にカードが新しい画像を表示する
+- **レースコンディション修正**: トークンベースの古いタスク破棄機構を追加。サムネイル生成前に起動した古い読み込みタスクが新画像を上書きする問題を解消
+- **F5再スキャン後のサムネイル非更新修正**: `force_reload_all()` で全キャッシュをクリアし、サムネイルファイルが同じパスに上書き保存された場合でも確実に再描画
+
+#### パフォーマンス改善
+- **キャッシュキーの rel_path 化（方針B）**: 全キャッシュキーを `abs_path` から `rel_path`（環境非依存・POSIX区切り）に変更。`Path.resolve()` の表記ゆれによるキャッシュミスを根本から解消
+- **保護パス機構**: `set_icon_directly()` で格納したキャッシュは3秒間、`clear_cache_for_path()` / `force_reload_all()` での削除から保護される
+
+#### その他改善
+- **`_LoraScanWorker` 独立化**: `main_window.UnmadeWildcardScanWorker` への依存を排除し、`new_wildcard_dialog.py` 内に独立実装
+- **FlowLayout 非表示ウィジェット対応**: `isVisible()` が False のウィジェットをレイアウト計算からスキップ
+- **LoRA マッチング精度向上**: テキスト全文一致 → LoRA名セット（`lora_names`）による照合に変更
+- **「全LoRA表示」チェックボックス追加**: 未作成LoRAグリッドに作成済みLoRAも表示するオプション
+- **デバッグ用画像ファイル削除**: リポジトリから不要なPNGファイルを除去
+
+---
+
 ### v1.x - 初期リリース
 
 #### 機能
