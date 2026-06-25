@@ -67,15 +67,36 @@ def open_in_file_manager(path: Path | str, *, select: bool = False) -> bool:
 
     Windows では ``explorer.exe /select,path`` 相当、それ以外では
     ``xdg-open`` (Linux) / ``open`` (macOS) を使う。失敗時は False を返す。
+
+    【WinError 6 対策】Windows で subprocess.Popen が親プロセスの不要なハンドルを
+    引き継いでしまうと「ハンドルが無効です」エラーが出ることがあるため、
+    close_fds=True を明示し、標準ハンドルを DEVNULL に向ける。
+    また STARTUPINFO を渡してコンソールウィンドウを抑制する。
     """
     p = Path(path)
     if sys.platform == "win32":
         import subprocess
         try:
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             if select and p.exists():
-                subprocess.Popen(["explorer.exe", "/select,", str(p)])
+                subprocess.Popen(
+                    ["explorer.exe", "/select,", str(p)],
+                    close_fds=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    startupinfo=startupinfo,
+                )
             elif p.exists():
-                subprocess.Popen(["explorer.exe", str(p)])
+                subprocess.Popen(
+                    ["explorer.exe", str(p)],
+                    close_fds=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    startupinfo=startupinfo,
+                )
             else:
                 return False
             return True
@@ -89,7 +110,13 @@ def open_in_file_manager(path: Path | str, *, select: bool = False) -> bool:
                 args += ["-R", str(p)]
             else:
                 args.append(str(p.parent if p.is_file() else p))
-            subprocess.Popen(args)
+            subprocess.Popen(
+                args,
+                close_fds=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
             return True
         except Exception:
             return False
@@ -97,7 +124,13 @@ def open_in_file_manager(path: Path | str, *, select: bool = False) -> bool:
         import subprocess
         try:
             target = str(p.parent if select and p.is_file() else (p if p.exists() else p.parent))
-            subprocess.Popen(["xdg-open", target])
+            subprocess.Popen(
+                ["xdg-open", target],
+                close_fds=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
             return True
         except Exception:
             return False
@@ -107,10 +140,15 @@ def is_path_within(child: Path, parent: Path) -> bool:
     """``child`` が ``parent`` 配下（同じ場合も含む）かどうかを安全に判定する。
 
     ``parent in child.parents`` はシンボリックリンク解決後のパスで判定する。
+    【WinError 6 対策】resolve() は OSError を投げうるので try/except で保護。
     """
     try:
-        child_res = child.resolve()
-        parent_res = parent.resolve()
-    except Exception:
-        return False
+        child_res = child.resolve(strict=False)
+        parent_res = parent.resolve(strict=False)
+    except (OSError, ValueError):
+        try:
+            child_res = child.absolute()
+            parent_res = parent.absolute()
+        except Exception:
+            return False
     return child_res == parent_res or parent_res in child_res.parents

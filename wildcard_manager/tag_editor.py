@@ -76,6 +76,10 @@ class FlowLayout(QLayout):
         row_height = 0
         for item in self._items:
             w = item.widget()
+            if w is not None and not w.isVisible():
+                if not dry_run:
+                    w.move(-9999, -9999)
+                continue
             hint = w.size() if (w is not None and w.size().isValid() and w.size().width() > 0) else (w.sizeHint() if w is not None else item.sizeHint())
             next_x = x + hint.width()
             if next_x > effective.right() + 1 and row_height > 0:

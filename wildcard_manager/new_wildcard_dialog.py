@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Qt, QEvent, QObject, Signal, Slot, QTimer
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QPixmap, QKeySequence, QFont
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFileDialog, QGridLayout, QGroupBox, QHBoxLayout,
     QLabel, QLineEdit, QListWidget, QMessageBox, QPushButton,
@@ -18,7 +18,6 @@ from .models import AppSettings, WildcardEntry
 from .repository import WildcardRepository
 from .single_thumbnail_worker import SingleThumbnailWorker
 from .tag_editor import FlowLayout, TagEditorWidget as _BaseTagEditorWidget
-from .ui_utils import setup_japanese_context_menu as _setup_japanese_context_menu
 
 # サムネイル生成時の一時プレビューディレクトリ名
 PREVIEW_THUMB_SUBDIR = "_preview_thumbs"
@@ -73,6 +72,45 @@ class _FolderPicker(QWidget):
     def setFixedHeight(self, h: int):
         self._edit.setFixedHeight(h)
         self._btn.setFixedHeight(h)
+
+
+def _setup_japanese_context_menu(widget):
+    """QLineEdit/QPlainTextEdit のコンテキストメニューを日本語化（イベントフィルター方式）"""
+    def _delete_selected_text(w):
+        """選択テキストを削除する（ウィジェット自体は消さない）"""
+        if hasattr(w, "textCursor"):
+            cursor = w.textCursor()
+            if cursor is not None and cursor.hasSelection():
+                cursor.removeSelectedText()
+                if hasattr(w, "setTextCursor"):
+                    w.setTextCursor(cursor)
+        elif hasattr(w, "del_"):
+            w.del_()
+
+    def show_menu(w, pos):
+        menu = QMenu(w)
+        menu.addAction("元に戻す", w.undo).setShortcut(QKeySequence("Ctrl+Z"))
+        menu.addAction("やり直し", w.redo).setShortcut(QKeySequence("Ctrl+Y"))
+        menu.addSeparator()
+        menu.addAction("切り取り", w.cut).setShortcut(QKeySequence("Ctrl+X"))
+        menu.addAction("コピー", w.copy).setShortcut(QKeySequence("Ctrl+C"))
+        menu.addAction("貼り付け", w.paste).setShortcut(QKeySequence("Ctrl+V"))
+        menu.addSeparator()
+        menu.addAction("削除", lambda w=w: _delete_selected_text(w))
+        menu.addSeparator()
+        menu.addAction("すべて選択", w.selectAll).setShortcut(QKeySequence("Ctrl+A"))
+        menu.exec(w.mapToGlobal(pos))
+
+    class _ContextMenuFilter(QObject):
+        def eventFilter(self, obj, event):
+            if event.type() == QEvent.ContextMenu:
+                show_menu(obj, event.pos())
+                return True
+            return super().eventFilter(obj, event)
+
+    filt = _ContextMenuFilter(widget)
+    widget._context_menu_filter = filt
+    widget.installEventFilter(filt)
 
 
 class NoDropPlainTextEdit(QPlainTextEdit):
@@ -161,26 +199,55 @@ class LoraCardWidget(QWidget):
 
 
 class _LoraScanWorker(QObject):
-    """バックグラウンドでLoRAフォルダをスキャンして未作成LoRA一覧を返すワーカー。
+    """バックグラウンドでLoRAフォルダをスキャンして未作成LoRA一覧を返すワーカー"""
 
-    L11 修正: 以前は main_window.UnmadeWildcardScanWorker とほぼ完全に
-    重複したコードを持っていた。main_window 側を直接 import して再利用する。
-    シグナル互換性のため、本クラスは thin wrapper として残す。
-    """
     finished = Signal(list)
     failed = Signal(str)
 
-    def __init__(self, lora_root: str, haystack: str):
+    def __init__(self, lora_root: str, haystack: set[str]):
         super().__init__()
-        # main_window 側の UnmadeWildcardScanWorker をそのまま再利用
-        from .main_window import UnmadeWildcardScanWorker
-        self._inner = UnmadeWildcardScanWorker(lora_root, haystack)
-        self._inner.finished.connect(self.finished.emit)
-        self._inner.failed.connect(self.failed.emit)
+        self.lora_root = lora_root
+        self.haystack = haystack
+
+    @staticmethod
+    def _find_preview(directory: Path, stem: str) -> Path | None:
+        for ext in [".preview.png", ".preview.jpg", ".preview.jpeg", ".preview.webp", ".png", ".jpg", ".jpeg", ".webp"]:
+            candidate = directory / f"{stem}{ext}"
+            if candidate.exists():
+                return candidate
+        return None
 
     @Slot()
     def run(self):
-        self._inner.run()
+        try:
+            lora_root = Path(self.lora_root)
+            if not lora_root.exists():
+                self.finished.emit([])
+                return
+            results = []
+            for safetensors in lora_root.rglob("*.safetensors"):
+                stem = safetensors.stem
+                cm_info = safetensors.parent / f"{stem}.cm-info.json"
+                if not cm_info.exists():
+                    continue
+                if stem.lower() in self.haystack:
+                    continue
+                preview = self._find_preview(safetensors.parent, stem)
+                try:
+                    with open(cm_info, "r", encoding="utf-8") as f:
+                        cm_data = json.load(f)
+                except Exception:
+                    cm_data = {}
+                results.append({
+                    "path": str(safetensors),
+                    "name": stem,
+                    "preview": str(preview) if preview else None,
+                    "trained_words": cm_data.get("TrainedWords", []),
+                    "model_name": cm_data.get("ModelName", ""),
+                })
+            self.finished.emit(results)
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
 
 class UnmadeLoraGridWidget(QWidget):
@@ -189,12 +256,13 @@ class UnmadeLoraGridWidget(QWidget):
     lora_selected = Signal(dict)
 
     def __init__(self, items: list[dict], lora_root: str = "",
-                 search_haystack: str = "", parent=None):
+                 search_haystack: set[str] | None = None, parent=None):
         super().__init__(parent)
         self._all_items = list(items)
         self._cards: list[LoraCardWidget] = []
         self._lora_root = lora_root
-        self._search_haystack = search_haystack
+        self._search_haystack: set[str] = search_haystack if search_haystack is not None else set()
+        self._show_all: bool = False
         self._scan_thread: QThread | None = None
         self._scan_worker: _LoraScanWorker | None = None
         self._build()
@@ -232,6 +300,12 @@ class UnmadeLoraGridWidget(QWidget):
         self._sort_combo.setFixedHeight(30)
         self._sort_combo.currentIndexChanged.connect(self._apply_sort)
         layout.addWidget(self._sort_combo)
+
+        self._chk_show_all = QCheckBox("全LoRAを表示（作成済み含む）")
+        self._chk_show_all.setChecked(False)
+        self._chk_show_all.setFixedHeight(26)
+        self._chk_show_all.toggled.connect(self._on_show_all_toggled)
+        layout.addWidget(self._chk_show_all)
 
         self._search = QLineEdit()
         self._search.setPlaceholderText("LoRAを検索...")
@@ -274,6 +348,8 @@ class UnmadeLoraGridWidget(QWidget):
         for card in self._cards:
             name = card.item_data.get("name", "").lower()
             card.setVisible(q in name if q else True)
+        self._grid_widget.adjustSize()
+        self._grid_widget.update()
 
     def _apply_sort(self):
         """プルダウンで選択された並び順で _all_items を並び替え、グリッドを作り直す"""
@@ -294,6 +370,10 @@ class UnmadeLoraGridWidget(QWidget):
         self._populate_cards()
         self._apply_filter(self._search.text())
 
+    def _on_show_all_toggled(self, checked: bool):
+        self._show_all = checked
+        self._rescan_folder()
+
     def _rescan_folder(self):
         lora_root = self._folder_picker.text().strip()
         if not lora_root:
@@ -301,7 +381,10 @@ class UnmadeLoraGridWidget(QWidget):
         self._btn_rescan.setEnabled(False)
         self._btn_rescan.setText("読込中...")
         self._scan_thread = QThread(self)
-        self._scan_worker = _LoraScanWorker(lora_root, self._search_haystack)
+        self._scan_worker = _LoraScanWorker(
+            lora_root,
+            set() if self._show_all else self._search_haystack,
+        )
         self._scan_worker.moveToThread(self._scan_thread)
         self._scan_thread.started.connect(self._scan_worker.run)
         self._scan_worker.finished.connect(self._on_rescan_finished)
@@ -1351,10 +1434,12 @@ class NewWildcardDialog(QDialog):
         if self._unmade_items is not None:
             splitter = QSplitter(Qt.Horizontal)
             splitter.setChildrenCollapsible(False)
-            haystack = "\n".join(
-                (e.search_text or "").lower()
+            haystack: set[str] = {
+                name.lower()
                 for e in self._repo.load_entries_summary(self._settings)
-            )
+                for name in (e.lora_names or [])
+                if name
+            }
             self._unmade_grid = UnmadeLoraGridWidget(
                 self._unmade_items,
                 lora_root=self._settings.lora_root,

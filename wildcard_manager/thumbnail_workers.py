@@ -34,15 +34,19 @@ class _CancellableRunnable(QRunnable):
 
 
 class ThumbnailLoadSignals(QObject):
-    loaded = Signal(str, int, object)
+    # 仕様変更: 第1引数を abs_path から rel_path に変更（方針B）。
+    # rel_path は環境非依存（POSIX 区切り）のため、パス正規化の不一致で
+    # キャッシュミスする問題を根本から解消する。
+    loaded = Signal(str, int, int, object)  # rel_path, thumbnail_size, token, image
 
 
 class ThumbnailLoadTask(_CancellableRunnable):
-    def __init__(self, abs_path: str, thumbnail_path: str, thumbnail_size: int, signals: ThumbnailLoadSignals):
+    def __init__(self, rel_path: str, thumbnail_path: str, thumbnail_size: int, token: int, signals: ThumbnailLoadSignals):
         super().__init__()
-        self.abs_path = abs_path
+        self.rel_path = rel_path
         self.thumbnail_path = thumbnail_path
         self.thumbnail_size = thumbnail_size
+        self.token = token
         self.signals = signals
 
     def _try_read_once(self) -> QImage | None:
@@ -79,7 +83,7 @@ class ThumbnailLoadTask(_CancellableRunnable):
                 time.sleep(THUMBNAIL_READ_RETRY_DELAY_SEC)
         if self.is_cancelled:
             return
-        self.signals.loaded.emit(self.abs_path, self.thumbnail_size, image)
+        self.signals.loaded.emit(self.rel_path, self.thumbnail_size, self.token, image)
 
 
 class EntryContentLoadSignals(QObject):

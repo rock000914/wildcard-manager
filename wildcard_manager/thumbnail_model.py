@@ -102,6 +102,9 @@ class ThumbnailListModel(QAbstractListModel):
         self.thumbnail_size = 260
         # icon_cache には「読み込みに成功したサムネイル」だけを保持する。
         # 失敗結果はここに入れない（失敗の永久キャッシュを防ぐ）。
+        # 【方針B】キーは (rel_path, thumbnail_size)。rel_path は環境非依存
+        # (POSIX 区切り) のため、abs_path 正規化の不一致でキャッシュミスする
+        # 問題を根本から回避できる。
         self.icon_cache: OrderedDict[tuple[str, int], QIcon] = OrderedDict()
         self.placeholder_cache: dict[int, QIcon] = {}
         self.max_icon_cache = 720
@@ -111,6 +114,16 @@ class ThumbnailListModel(QAbstractListModel):
         self._last_attempt: dict[tuple[str, int], float] = {}
         # 画面の再描画を待たずに自動復旧させるためのバックグラウンド再試行回数。
         self._auto_retry_counts: dict[tuple[str, int], int] = {}
+        # 【レースコンディション修正】各キーごとのロードトークン。
+        # 新しいロードを開始するたびにインクリメントされ、古いタスクの結果は破棄される。
+        # これにより「サムネイル生成前に起動した古いタスクが新画像を上書きする」問題を解消する。
+        self._load_tokens: dict[tuple[str, int], int] = {}
+        # 【保護パス】set_icon_directly でキャッシュに格納した rel_path。
+        # 一定時間（3秒間）は clear_cache_for_path や force_reload_all での
+        # キャッシュ削除から保護される。これにより、サムネイル生成後に遅延
+        # シグナル等でキャッシュが消されるのを確実に防ぐ。
+        self._protected_paths: dict[str, float] = {}  # rel_path -> expire_timestamp
+        # 【方針B】row_by_path のキーは rel_path（環境非依存）。
         self.row_by_path: dict[str, int] = {}
         # L8 修正: グローバル QThreadPool を直接 setMaxThreadCount すると
         # 他コンポーネント（PreviewLoadTask 等）にも影響する。
@@ -121,8 +134,10 @@ class ThumbnailListModel(QAbstractListModel):
         self.loader_signals.loaded.connect(self._handle_loaded_thumbnail)
 
     def set_entries(self, entries: list[WildcardEntry]) -> None:
+        # 【方針B】リスト同一性判定・row_by_path 構築ともに rel_path をキーに使う。
+        # abs_path は OS・resolve() の有無で表記ゆれするため、同値判定に不適。
         if len(self.entries) == len(entries) and all(
-            self.entries[i].abs_path == entries[i].abs_path for i in range(len(entries))
+            self.entries[i].rel_path == entries[i].rel_path for i in range(len(entries))
         ):
             changed_rows: list[int] = []
             for i, entry in enumerate(entries):
@@ -131,13 +146,11 @@ class ThumbnailListModel(QAbstractListModel):
                         or old.first_line != entry.first_line
                         or old.has_thumbnail != entry.has_thumbnail
                         or old.stem != entry.stem)
-                # entry自体の値が変わっていなくても、直前の読み込みが失敗していた
-                # 場合はF5（=set_entriesの再呼び出し）で必ず再評価する。
-                # これがないと、サムネイル生成が一覧表示より遅れて完了した際に
-                # 失敗状態のまま二度とリトライされなくなる（F5を押しても直らない）。
-                previously_failed = self._has_failed_thumbnail(entry.abs_path)
+                previously_failed = self._has_failed_thumbnail(entry.rel_path)
                 if fields_changed or previously_failed:
-                    self.clear_cache_for_path(entry.abs_path)
+                    key = (entry.rel_path, self.thumbnail_size)
+                    if key not in self.icon_cache:
+                        self.clear_cache_for_path(entry.rel_path)
                     self.entries[i] = entry
                     changed_rows.append(i)
             if changed_rows:
@@ -147,11 +160,49 @@ class ThumbnailListModel(QAbstractListModel):
             return
         self.beginResetModel()
         self.entries = list(entries)
-        self.row_by_path = {entry.abs_path: index for index, entry in enumerate(self.entries)}
+        self.row_by_path = {entry.rel_path: index for index, entry in enumerate(self.entries)}
         self.endResetModel()
 
-    def _has_failed_thumbnail(self, abs_path: str) -> bool:
-        return any(key[0] == abs_path for key in self.failed_keys)
+    def _has_failed_thumbnail(self, rel_path: str) -> bool:
+        return any(key[0] == rel_path for key in self.failed_keys)
+
+    def _is_protected(self, rel_path: str) -> bool:
+        """指定 rel_path が保護期間内かどうかを判定し、期限切れのエントリをクリーンアップする。"""
+        now = time.time()
+        expire = self._protected_paths.get(rel_path)
+        if expire is None:
+            return False
+        if now >= expire:
+            del self._protected_paths[rel_path]
+            return False
+        return True
+
+    def force_reload_all(self) -> None:
+        """全キャッシュをクリアし、全行の dataChanged を発火して強制再描画する。"""
+        # 保護パスのキャッシュは保持し、それ以外をクリア
+        protected_set: set[str] = set()
+        now = time.time()
+        for path, expire in list(self._protected_paths.items()):
+            if now < expire:
+                protected_set.add(path)
+            else:
+                del self._protected_paths[path]
+
+        self.icon_cache = OrderedDict(
+            (key, value) for key, value in self.icon_cache.items()
+            if key[0] in protected_set
+        )
+        self.pending_loads = {key for key in self.pending_loads if key[0] in protected_set}
+        self.failed_keys = {key for key in self.failed_keys if key[0] in protected_set}
+        self._last_attempt = {key: ts for key, ts in self._last_attempt.items() if key[0] in protected_set}
+        self._auto_retry_counts = {key: c for key, c in self._auto_retry_counts.items() if key[0] in protected_set}
+        for key in list(self._load_tokens.keys()):
+            if key[0] not in protected_set:
+                self._load_tokens[key] = self._load_tokens[key] + 1
+        if self.entries:
+            first = self.index(0, 0)
+            last = self.index(len(self.entries) - 1, 0)
+            self.dataChanged.emit(first, last, [Qt.DecorationRole])
 
     def set_thumbnail_size(self, size: int) -> None:
         if self.thumbnail_size == size:
@@ -163,26 +214,79 @@ class ThumbnailListModel(QAbstractListModel):
         self.failed_keys.clear()
         self._last_attempt.clear()
         self._auto_retry_counts.clear()
+        self._load_tokens.clear()
+        self._protected_paths.clear()
         if self.entries:
             self.dataChanged.emit(self.index(0, 0), self.index(len(self.entries) - 1, 0), [Qt.DecorationRole, Qt.SizeHintRole])
 
-    def clear_cache_for_path(self, abs_path: str) -> None:
-        self.icon_cache = OrderedDict((key, value) for key, value in self.icon_cache.items() if key[0] != abs_path)
-        self.pending_loads = {key for key in self.pending_loads if key[0] != abs_path}
-        self.failed_keys = {key for key in self.failed_keys if key[0] != abs_path}
-        self._last_attempt = {key: ts for key, ts in self._last_attempt.items() if key[0] != abs_path}
-        self._auto_retry_counts = {key: c for key, c in self._auto_retry_counts.items() if key[0] != abs_path}
+    def clear_cache_for_path(self, rel_path: str) -> None:
+        # 【方針B】rel_path をキーにキャッシュ削除。
+        # 【保護パス】set_icon_directly で最近格納された rel_path は
+        # キャッシュ削除から保護する（サムネイル生成直後の保護）
+        if self._is_protected(rel_path):
+            return
+        self.icon_cache = OrderedDict((key, value) for key, value in self.icon_cache.items() if key[0] != rel_path)
+        self.pending_loads = {key for key in self.pending_loads if key[0] != rel_path}
+        self.failed_keys = {key for key in self.failed_keys if key[0] != rel_path}
+        self._last_attempt = {key: ts for key, ts in self._last_attempt.items() if key[0] != rel_path}
+        self._auto_retry_counts = {key: c for key, c in self._auto_retry_counts.items() if key[0] != rel_path}
+        # 【レースコンディション修正】トークンをインクリメントして、
+        # この rel_path に対する全ての古いタスクの結果を無効化する。
+        for key in list(self._load_tokens.keys()):
+            if key[0] == rel_path:
+                self._load_tokens[key] = self._load_tokens[key] + 1
 
     def replace_entry(self, updated: WildcardEntry) -> None:
-        row = self.row_by_path.get(updated.abs_path)
+        # 【方針B】rel_path をキーに行を検索。
+        row = self.row_by_path.get(updated.rel_path)
         if row is None or row >= len(self.entries):
             return
         self.entries[row] = updated
-        self.row_by_path[updated.abs_path] = row
+        self.row_by_path[updated.rel_path] = row
         # キャッシュをクリアして再ロードさせる（beginResetModelは選択を解除するので避ける）
-        self.clear_cache_for_path(updated.abs_path)
+        self.clear_cache_for_path(updated.rel_path)
         index = self.index(row, 0)
         self.dataChanged.emit(index, index, [Qt.DecorationRole, Qt.DisplayRole, Qt.SizeHintRole])
+
+    def set_icon_directly(self, rel_path: str, image: QImage) -> None:
+        """生成直後のサムネイルを同期的に icon_cache へ格納し、即座に dataChanged を発火する。
+
+        【根本修正（方針B）】サムネイル生成後に非同期 ThumbnailLoadTask 経由でカードが
+        更新されない問題に対し、生成完了コールバック内でファイルを同期的に
+        読み込み、このメソッドで直接キャッシュへ格納する。
+        これにより非同期パイプラインの遅延や失敗に依存せず、即座にカードが
+        新しいサムネイルを表示する。
+
+        また、トークンをインクリメントすることで、進行中の古い ThumbnailLoadTask
+        が完了してもその結果（旧画像）がキャッシュを上書きしないようにする。
+
+        【保護パス】このメソッドで格納した rel_path は3秒間保護され、
+        clear_cache_for_path や force_reload_all での削除から保護される。
+        これにより、サムネイル生成後に遅延シグナル等でキャッシュが
+        消されるのを確実に防ぐ。
+
+        【方針B】引数は abs_path ではなく rel_path（環境非依存）。
+        これにより _build_entry と _portable_abs_path の表記ゆれを気にせず
+        常に正しい行へキャッシュを格納できる。
+        """
+        key = (rel_path, self.thumbnail_size)
+        self.failed_keys.discard(key)
+        self._last_attempt.pop(key, None)
+        self._auto_retry_counts.pop(key, None)
+        self.pending_loads.discard(key)
+        # トークンをインクリメント → 古いタスクの結果は破棄される
+        self._load_tokens[key] = self._load_tokens.get(key, 0) + 1
+        # 保護パスに登録（3秒間）
+        self._protected_paths[rel_path] = time.time() + 3.0
+        icon = QIcon(QPixmap.fromImage(image))
+        self.icon_cache[key] = icon
+        self.icon_cache.move_to_end(key)
+        while len(self.icon_cache) > self.max_icon_cache:
+            self.icon_cache.popitem(last=False)
+        row = self.row_by_path.get(rel_path)
+        if row is not None and 0 <= row < len(self.entries):
+            index = self.index(row, 0)
+            self.dataChanged.emit(index, index, [Qt.DecorationRole])
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         return 0 if parent.isValid() else len(self.entries)
@@ -212,7 +316,8 @@ class ThumbnailListModel(QAbstractListModel):
         return self.entries[row]
 
     def _get_icon(self, entry: WildcardEntry) -> QIcon:
-        key = (entry.abs_path, self.thumbnail_size)
+        # 【方針B】entry.rel_path をキーにキャッシュ検索。
+        key = (entry.rel_path, self.thumbnail_size)
         cached = self.icon_cache.get(key)
         if cached is not None:
             self.icon_cache.move_to_end(key)
@@ -221,7 +326,9 @@ class ThumbnailListModel(QAbstractListModel):
         return self._get_placeholder_icon()
 
     def _queue_thumbnail_load(self, entry: WildcardEntry, priority: int = 0, force: bool = False) -> None:
-        key = (entry.abs_path, self.thumbnail_size)
+        # 【方針B】entry.rel_path をキーに使用。ThumbnailLoadTask にも
+        # rel_path を渡す（シグナルのペイロードも rel_path になる）。
+        key = (entry.rel_path, self.thumbnail_size)
         if key in self.icon_cache or key in self.pending_loads:
             return
         if not entry.thumbnail_path or not entry.has_thumbnail:
@@ -234,8 +341,12 @@ class ThumbnailListModel(QAbstractListModel):
                 return
         self.pending_loads.add(key)
         self._last_attempt[key] = time.monotonic()
+        # 【レースコンディション修正】トークンをインクリメントして新しいタスクに割り当てる。
+        # 古いタスクが完了しても _handle_loaded_thumbnail でトークンが不一致なら破棄される。
+        token = self._load_tokens.get(key, 0) + 1
+        self._load_tokens[key] = token
         self.thread_pool.start(
-            ThumbnailLoadTask(entry.abs_path, entry.thumbnail_path, self.thumbnail_size, self.loader_signals),
+            ThumbnailLoadTask(entry.rel_path, entry.thumbnail_path, self.thumbnail_size, token, self.loader_signals),
             priority,
         )
 
@@ -244,13 +355,13 @@ class ThumbnailListModel(QAbstractListModel):
         クールダウンを無視して強制的に再評価する。"""
         if not self.entries:
             return
-        targets = [entry for entry in self.entries if self._has_failed_thumbnail(entry.abs_path)]
+        targets = [entry for entry in self.entries if self._has_failed_thumbnail(entry.rel_path)]
         if not targets:
             return
         for entry in targets:
-            self.clear_cache_for_path(entry.abs_path)
+            self.clear_cache_for_path(entry.rel_path)
             self._queue_thumbnail_load(entry, priority=0, force=True)
-        rows = sorted(self.row_by_path[e.abs_path] for e in targets if e.abs_path in self.row_by_path)
+        rows = sorted(self.row_by_path[e.rel_path] for e in targets if e.rel_path in self.row_by_path)
         if rows:
             self.dataChanged.emit(self.index(rows[0], 0), self.index(rows[-1], 0), [Qt.DecorationRole])
 
@@ -272,11 +383,12 @@ class ThumbnailListModel(QAbstractListModel):
         delay_ms = int(self.FAILED_RETRY_COOLDOWN_SEC * 1000)
 
         def _retry():
+            # 【方針B】key[0] は rel_path。
             row = self.row_by_path.get(key[0])
             if row is None or not (0 <= row < len(self.entries)):
                 return
             entry = self.entries[row]
-            if (entry.abs_path, self.thumbnail_size) != key:
+            if (entry.rel_path, self.thumbnail_size) != key:
                 return  # サムネイルサイズが変わった等、状況が変化していたら何もしない
             if key not in self.failed_keys:
                 return  # その間に別経路で成功済みなら何もしない
@@ -284,15 +396,16 @@ class ThumbnailListModel(QAbstractListModel):
 
         QTimer.singleShot(delay_ms, _retry)
 
-    @Slot(str, int, object)
-    def _handle_loaded_thumbnail(self, abs_path: str, thumbnail_size: int, image: QImage | None) -> None:
-        key = (abs_path, thumbnail_size)
+    @Slot(str, int, int, object)
+    def _handle_loaded_thumbnail(self, rel_path: str, thumbnail_size: int, token: int, image: QImage | None) -> None:
+        # 【方針B】シグナルの第1引数は rel_path。abs_path の表記ゆれを気にせず
+        # 常に正しい行を更新できる。
+        key = (rel_path, thumbnail_size)
         self.pending_loads.discard(key)
+        current_token = self._load_tokens.get(key, 0)
+        if token != current_token:
+            return
         if image is None:
-            # 失敗結果は icon_cache に入れない。failed_keys にだけ記録し、
-            # 表示自体はプレースホルダー（_get_placeholder_icon）に任せる。
-            # こうすることで、次にこの行が再評価された時（リペイント／F5／
-            # set_entriesの再呼び出し）に必ずもう一度読み込みを試せる。
             self.failed_keys.add(key)
             self._schedule_auto_retry(key)
         else:
@@ -304,7 +417,7 @@ class ThumbnailListModel(QAbstractListModel):
             self.icon_cache.move_to_end(key)
             while len(self.icon_cache) > self.max_icon_cache:
                 self.icon_cache.popitem(last=False)
-        row = self.row_by_path.get(abs_path)
+        row = self.row_by_path.get(rel_path)
         if row is not None and 0 <= row < len(self.entries):
             index = self.index(row, 0)
             self.dataChanged.emit(index, index, [Qt.DecorationRole])

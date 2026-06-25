@@ -16,7 +16,7 @@ from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 
 from PySide6.QtCore import QFile, QModelIndex, QObject, QPoint, QRect, QRectF, QSignalBlocker, QSize, Qt, QThread, QThreadPool, QTimer, Signal, Slot, QEvent, QFileSystemWatcher
-from PySide6.QtGui import QAction, QActionGroup, QClipboard, QCloseEvent, QColor, QFont, QFontMetrics, QIcon, QImage, QKeySequence, QPainter, QPainterPath, QPixmap
+from PySide6.QtGui import QAction, QActionGroup, QClipboard, QCloseEvent, QColor, QFont, QFontMetrics, QIcon, QImage, QImageReader, QKeySequence, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -63,7 +63,7 @@ from PySide6.QtWidgets import (
 from .api import ThumbnailApiClient
 from .config import SettingsStore, UIStateStore
 from .models import AppSettings, WildcardEntry
-from .repository import CONFLICT_POLICIES, OperationCancelledError, WildcardRepository, sidecar_metadata_path, strip_lora_tags, parse_prompt_tags
+from .repository import CONFLICT_POLICIES, OperationCancelledError, WildcardRepository, sidecar_metadata_path, strip_lora_tags, parse_prompt_tags, _safe_resolve_path
 from .thumbnail_model import ThumbnailListModel, ThumbnailItemDelegate, ThumbnailCardDelegate, CARD_ICON_RATIO, CARD_TITLE_HEIGHT, CARD_FRAME_PADDING
 from .thumbnail_workers import ThumbnailLoadSignals, ThumbnailLoadTask, EntryContentLoadSignals, EntryContentLoadTask, PreviewLoadSignals, PreviewLoadTask
 from .tag_editor import FlowLayout, TagChip, TagEditorWidget
@@ -1077,7 +1077,8 @@ class RandomGenerationWorker(QObject):
     @Slot()
     def run(self) -> None:
         try:
-            output_root = Path(self.request.output_root or self.settings.library_root).resolve()
+            # 【WinError 6 対策】_safe_resolve_path でラップ
+            output_root = _safe_resolve_path(Path(self.request.output_root or self.settings.library_root))
             if self.request.save_mode == "date_folder":
                 output_root = output_root / datetime.now().strftime("%Y-%m-%d")
             output_root.mkdir(parents=True, exist_ok=True)
@@ -3508,6 +3509,10 @@ class MainWindow(QMainWindow):
             current_item = self.folder_tree.currentItem()
             self.current_folder_prefix = current_item.data(0, Qt.UserRole) if current_item else ""
             self.apply_filters()
+            # 【F5修正】再スキャン後に全サムネイルキャッシュをクリアして
+            # 強制再描画。サムネイルファイルが同じパスに上書き保存された場合、
+            # set_entries の fields_changed チェックでは検出できないため。
+            self.list_model.force_reload_all()
             self._populate_lora_cloud()
             # The initial async load can arrive after the first layout pass, so
             # force one more geometry refresh once real items are in the model.
@@ -4328,18 +4333,64 @@ class MainWindow(QMainWindow):
             return False
 
     def _replace_entry(self, updated: WildcardEntry) -> None:
+        """エントリを更新して UI に反映する。サムネイル生成後に左カードが即座に更新される。
+
+        【方針B】パス正規化の不一致で row_by_path が miss する問題を解消するため、
+        list_model 側は rel_path をキーに持つ。ここでも updated.rel_path を使って
+        行を検索・キャッシュ更新・set_icon_directly を呼ぶ。
+        """
+        # 1) 自前で持っている entries / filtered_entries を更新
         for index, entry in enumerate(self.entries):
-            if entry.abs_path == updated.abs_path:
+            if entry.abs_path == updated.abs_path or entry.rel_path == updated.rel_path:
                 self.entries[index] = updated
                 break
         self.current_entry = updated
         self._set_edit_mode(False)
         self._rebuild_entry_indexes()
-        self.list_model.clear_cache_for_path(updated.abs_path)
+
+        self.filter_timer.stop()
+
+        # 2) list_model 側のエントリを更新（rel_path で検索）
+        row_pre = self.list_model.row_by_path.get(updated.rel_path)
+        if row_pre is not None and row_pre < len(self.list_model.entries):
+            self.list_model.entries[row_pre] = updated
+
+        # 3) キャッシュをクリア（保護パス機構により直前の set_icon_directly は保護される）
+        self.list_model.clear_cache_for_path(updated.rel_path)
+
+        # 4) 生成直後のサムネイルを同期的に読み込んでキャッシュへ格納。
+        #    非同期パイプラインを待たず即座にカードが新しい画像を表示する。
+        icon_loaded = False
+        if updated.thumbnail_path and updated.has_thumbnail:
+            try:
+                thumb_file = Path(updated.thumbnail_path)
+                if thumb_file.exists():
+                    raw_bytes = thumb_file.read_bytes()
+                    raw_image = QImage()
+                    raw_image.loadFromData(raw_bytes)
+                    if not raw_image.isNull():
+                        thumb_size = max(80, self.list_model.thumbnail_size)
+                        scaled = raw_image.scaled(
+                            QSize(thumb_size, int(thumb_size * 1.5)),
+                            Qt.KeepAspectRatio,
+                            Qt.SmoothTransformation,
+                        )
+                        if not scaled.isNull():
+                            # 【方針B】rel_path を渡す
+                            self.list_model.set_icon_directly(updated.rel_path, scaled)
+                            icon_loaded = True
+            except Exception:
+                pass
+
         self.apply_filters()
-        row = self.list_model.row_by_path.get(updated.abs_path)
-        if row is not None and row < len(self.list_model.entries):
-            self.list_model.entries[row] = updated
+
+        if not icon_loaded:
+            row = self.list_model.row_by_path.get(updated.rel_path)
+            if row is not None and row < len(self.list_model.entries):
+                idx = self.list_model.index(row, 0)
+                self.list_model.dataChanged.emit(idx, idx, [Qt.DecorationRole, Qt.DisplayRole, Qt.SizeHintRole])
+
+        self.card_view.viewport().update()
         self._show_entry(updated)
 
     def _prepare_copy_text(self, text: str, include_lora: bool) -> str:
@@ -4570,9 +4621,40 @@ class MainWindow(QMainWindow):
 
     def _on_missing_thumb_item_finished(self, updated: WildcardEntry) -> None:
         for pos, existing in enumerate(self.entries):
-            if existing.abs_path == updated.abs_path:
+            if existing.abs_path == updated.abs_path or existing.rel_path == updated.rel_path:
                 self.entries[pos] = updated
                 break
+        for pos, existing in enumerate(self.filtered_entries):
+            if existing.abs_path == updated.abs_path or existing.rel_path == updated.rel_path:
+                self.filtered_entries[pos] = updated
+                break
+        # 【方針B】rel_path をキーにキャッシュ操作
+        self.list_model.clear_cache_for_path(updated.rel_path)
+        row = self.list_model.row_by_path.get(updated.rel_path)
+        if row is not None and row < len(self.list_model.entries):
+            self.list_model.entries[row] = updated
+            idx = self.list_model.index(row, 0)
+            self.list_model.dataChanged.emit(idx, idx, [Qt.DecorationRole, Qt.DisplayRole, Qt.SizeHintRole])
+            if updated.thumbnail_path:
+                try:
+                    thumb_file = Path(updated.thumbnail_path)
+                    if thumb_file.exists():
+                        raw_bytes = thumb_file.read_bytes()
+                        raw_image = QImage()
+                        raw_image.loadFromData(raw_bytes)
+                        if not raw_image.isNull():
+                            thumb_size = max(80, self.list_model.thumbnail_size)
+                            scaled = raw_image.scaled(
+                                QSize(thumb_size, int(thumb_size * 1.5)),
+                                Qt.KeepAspectRatio,
+                                Qt.SmoothTransformation,
+                            )
+                            if not scaled.isNull():
+                                # 【方針B】rel_path を渡す
+                                self.list_model.set_icon_directly(updated.rel_path, scaled)
+                except Exception:
+                    pass
+        self.card_view.viewport().update()
         self._missing_thumb_done += 1
 
     def _on_missing_thumb_item_failed(self, abs_path: str, message: str) -> None:

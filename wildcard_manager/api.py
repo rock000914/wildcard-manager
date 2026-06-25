@@ -168,18 +168,26 @@ class ThumbnailApiClient:
         Repository 側のフォールバックリーダと同じ挙動にするため、
         3エンコーディングを順に試す。
         M7 修正: 除外パスの比較を resolve() 済みで行う。
+        【WinError 6 対策】resolve() は OSError を投げうるので try/except で保護。
         """
         root = Path(folder)
         if not root.is_dir():
             return ""
         try:
-            exclude_resolved = Path(exclude_path).resolve()
+            try:
+                exclude_resolved = Path(exclude_path).resolve(strict=False)
+            except (OSError, ValueError):
+                exclude_resolved = Path(exclude_path).absolute()
         except Exception:
             exclude_resolved = Path(exclude_path)
         candidates: list[Path] = []
         for p in root.glob("*.txt"):
             try:
-                if p.resolve() != exclude_resolved:
+                try:
+                    p_resolved = p.resolve(strict=False)
+                except (OSError, ValueError):
+                    p_resolved = p.absolute()
+                if p_resolved != exclude_resolved:
                     candidates.append(p)
             except Exception:
                 if str(p) != exclude_path:

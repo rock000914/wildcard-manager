@@ -17,6 +17,42 @@ TEXT_ENCODINGS = ("utf-8", "utf-8-sig", "cp932")
 _NATURAL_SPLIT = re.compile(r"(\d+)")
 
 
+def _safe_resolve(path: Path) -> str:
+    """Windows 環境で Path.resolve() が OSError [WinError 6] を投げる問題へ対処する。
+
+    strict=False で呼んでも Windows ではレースコンディションやハンドル問題で
+    例外が上がるケースがある。その場合は absolute() にフォールバックし、
+    それでも失敗する場合は str(path) を返す。
+
+    これにより scan_library / move_entry / delete_folder / _transfer_file /
+    _build_entry / _portable_abs_path など resolve() を呼ぶ全箇所で安全に
+    絶対パス文字列を取得できる。
+
+    【方針A】パス正規化を一元化する目的で用意した共通関数。
+    """
+    try:
+        return str(path.resolve(strict=False))
+    except (OSError, ValueError):
+        try:
+            return str(path.absolute())
+        except Exception:
+            return str(path)
+
+
+def _safe_resolve_path(path: Path) -> Path:
+    """Path 型で欲しい場合の _safe_resolve 版。
+
+    move_entry / delete_folder では resolve() 済みの Path が必要なため用意した。
+    """
+    try:
+        return path.resolve(strict=False)
+    except (OSError, ValueError):
+        try:
+            return path.absolute()
+        except Exception:
+            return path
+
+
 def natural_sort_key(text: str) -> tuple[object, ...]:
     parts = _NATURAL_SPLIT.split(text.lower())
     key: list[object] = []
@@ -262,26 +298,20 @@ class WildcardRepository:
             # Organize DB rows by directory for quick known-paths population
             current_rows_by_dir: dict[str, list[str]] = {}
             for abs_p in current_rows.keys():
-                try:
-                    parent = str(Path(abs_p).parent.resolve())
-                except Exception:
-                    parent = str(Path(abs_p).parent)
+                # 【WinError 6 対策】_safe_resolve でラップ
+                parent = _safe_resolve(Path(abs_p).parent)
                 current_rows_by_dir.setdefault(parent, []).append(abs_p)
 
             walk_start = time.perf_counter()
             for root, dirs, files in os.walk(library_root):
-                try:
-                    root_res = str(Path(root).resolve())
-                except Exception:
-                    root_res = str(root)
+                # 【WinError 6 対策】_safe_resolve でラップ
+                root_res = _safe_resolve(Path(root))
                 # M11 修正: 読みにくい for/else + デッドコード (root = root) を整理。
                 if skip_dirs:
                     skip_resolved: list[str] = []
                     for s in skip_dirs:
-                        try:
-                            skip_resolved.append(str(Path(s).resolve()))
-                        except Exception:
-                            skip_resolved.append(str(s))
+                        # 【WinError 6 対策】_safe_resolve でラップ
+                        skip_resolved.append(_safe_resolve(Path(s)))
                     if any(root_res.startswith(s_res) for s_res in skip_resolved):
                         self._append_profile(f"scan_library: skipping_dir_by_list={root_res}")
                         dirs[:] = []
@@ -302,10 +332,8 @@ class WildcardRepository:
                         continue
                     index += 1
                     txt_path = Path(root) / fname
-                    try:
-                        abs_path = str(txt_path.resolve())
-                    except Exception:
-                        abs_path = str(txt_path)
+                    # 【WinError 6 対策】_safe_resolve でラップ
+                    abs_path = _safe_resolve(txt_path)
                     known_paths.add(abs_path)
                     row = current_rows.get(abs_path)
                     sidecar_path = sidecar_metadata_path(txt_path)
@@ -432,8 +460,9 @@ class WildcardRepository:
         上で library_root 配下か検証する。
         """
         # dest_folder は POSIX 区切り（"/"）で渡る想定。OS 非依存に合成する。
-        library_root = Path(settings.library_root).resolve()
-        thumbnail_root = Path(settings.thumbnail_root).resolve()
+        # 【WinError 6 対策】_safe_resolve_path でラップ
+        library_root = _safe_resolve_path(Path(settings.library_root))
+        thumbnail_root = _safe_resolve_path(Path(settings.thumbnail_root))
 
         # ライブラリ外への脱出を防ぐため、dest_folder を POSIX 区切りで分割して
         # Path(*parts) で合成する。Path(dest_folder) だと Windows でバックスラッシュ
@@ -441,7 +470,7 @@ class WildcardRepository:
         clean_folder = dest_folder.strip().replace("\\", "/").strip("/")
         if clean_folder:
             parts = [p for p in clean_folder.split("/") if p not in ("", ".")]
-            dest_dir = (library_root / Path(*parts)).resolve() if parts else library_root
+            dest_dir = _safe_resolve_path(library_root / Path(*parts)) if parts else library_root
         else:
             dest_dir = library_root
 
@@ -464,7 +493,7 @@ class WildcardRepository:
         if src_thumb and Path(src_thumb).exists():
             # サムネ側も同じくライブラリ（サムネイルルート）配下に制限する
             if clean_folder:
-                thumb_dest_dir = (thumbnail_root / Path(*parts)).resolve()
+                thumb_dest_dir = _safe_resolve_path(thumbnail_root / Path(*parts))
             else:
                 thumb_dest_dir = thumbnail_root
             if thumb_dest_dir != thumbnail_root and thumbnail_root not in thumb_dest_dir.parents:
@@ -481,10 +510,11 @@ class WildcardRepository:
         if not folder_rel_path:
             raise ValueError("ルートフォルダ全体は削除できません。")
 
-        library_root = Path(settings.library_root).resolve()
-        thumbnail_root = Path(settings.thumbnail_root).resolve()
-        target_folder = (library_root / Path(folder_rel_path)).resolve()
-        target_thumbnails = (thumbnail_root / Path(folder_rel_path)).resolve()
+        # 【WinError 6 対策】_safe_resolve_path でラップ
+        library_root = _safe_resolve_path(Path(settings.library_root))
+        thumbnail_root = _safe_resolve_path(Path(settings.thumbnail_root))
+        target_folder = _safe_resolve_path(library_root / Path(folder_rel_path))
+        target_thumbnails = _safe_resolve_path(thumbnail_root / Path(folder_rel_path))
 
         if library_root not in target_folder.parents:
             raise ValueError("削除対象がライブラリ外です。")
@@ -582,12 +612,9 @@ class WildcardRepository:
         上書き可能なので unlink を省略し、copy2 も同様に直接上書きする。
         """
         destination.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            if source.resolve() == destination.resolve():
-                return False
-        except Exception:
-            if str(source) == str(destination):
-                return False
+        # 【WinError 6 対策】_safe_resolve でラップ
+        if _safe_resolve(source) == _safe_resolve(destination):
+            return False
         if destination.exists() and not self._should_replace(source, destination, conflict_policy):
             return False
         # destination.exists() の場合は shutil 側で上書きされる。
@@ -683,9 +710,13 @@ class WildcardRepository:
         lora_names = extract_lora_names(content)
         thumb_path = resolved_thumb if resolved_thumb is not None else self.resolve_thumbnail_path(settings, txt_path)
         lines = [line for line in content.splitlines() if line.strip()]
+        # 【方針A・WinError 6 対策】モジュールレベルの _safe_resolve を使用。
+        # _build_entry と _portable_abs_path で同じ正規化ロジックを使うことで
+        # abs_path の表記ゆれを防ぐ。ただし方針B（rel_path をキーに使用）により、
+        # 仮に表記ゆれが残ってもキャッシュミスは起きない。
         return WildcardEntry(
             rel_path=rel_path,
-            abs_path=str(txt_path.resolve()),
+            abs_path=_safe_resolve(txt_path),
             folder=folder,
             name=txt_path.name,
             stem=txt_path.stem,
@@ -694,7 +725,7 @@ class WildcardRepository:
             line_count=len(lines),
             custom_tags=custom_tags,
             lora_names=lora_names,
-            thumbnail_path=str(thumb_path.resolve()) if thumb_path else None,
+            thumbnail_path=_safe_resolve(thumb_path) if thumb_path else None,
             has_thumbnail=bool(thumb_path),
             search_text=" ".join(
                 [
@@ -792,7 +823,11 @@ class WildcardRepository:
 
     def _portable_abs_path(self, settings: AppSettings, rel_path: str, fallback: str) -> str:
         candidate = Path(settings.library_root) / Path(rel_path)
-        return str(candidate)
+        # 【方針A・WinError 6 対策】モジュールレベルの _safe_resolve を使用して
+        # _build_entry と同じ正規化ロジックで abs_path を生成する。
+        # これにより両者の表記ゆれを解消。仮にゆれが残っても方針B（rel_path を
+        # キーに使用）によりキャッシュミスは起きない。
+        return _safe_resolve(candidate)
 
     def _portable_thumbnail_path(self, settings: AppSettings, rel_path: str, stored_path: str | None) -> str | None:
         if not stored_path:
