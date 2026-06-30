@@ -3978,10 +3978,18 @@ class MainWindow(QMainWindow):
 
             new_txt = src_txt.with_stem(new_name)
             new_sidecar = sidecar_metadata_path(new_txt)
-            new_thumb = src_thumb.with_stem(new_name) if src_thumb else None
+            # Preserve the full suffix pattern (e.g. .preview.png)
+            thumb_suffix = src_thumb.name[len(src_thumb.stem):]
+            new_thumb = src_thumb.parent / f"{new_name}{thumb_suffix}" if src_thumb else None
 
             if new_txt.exists() and new_txt != src_txt:
                 QMessageBox.warning(self, "名前変更エラー", f"同名のファイルが既に存在します:\n{new_txt.name}")
+                return
+            if new_sidecar.exists() and new_sidecar != src_sidecar:
+                QMessageBox.warning(self, "名前変更エラー", f"同名のsidecarが既に存在します:\n{new_sidecar.name}")
+                return
+            if new_thumb and new_thumb.exists() and new_thumb != src_thumb:
+                QMessageBox.warning(self, "名前変更エラー", f"同名のサムネイルが既に存在します:\n{new_thumb.name}")
                 return
 
             src_txt.rename(new_txt)
