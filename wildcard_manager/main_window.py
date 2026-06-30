@@ -235,6 +235,8 @@ class SlowWheelListView(QListView):
     def __init__(self, scroll_step: int = 30, parent=None):
         super().__init__(parent)
         self.scroll_step = scroll_step
+        self._anchor_visual_row: int | None = None
+        self._anchor_visual_col: int | None = None
 
     def wheelEvent(self, event) -> None:
         delta = event.angleDelta().y()
@@ -245,6 +247,57 @@ class SlowWheelListView(QListView):
         notches = delta / 120.0
         bar.setValue(bar.value() - int(notches * self.scroll_step))
         event.accept()
+
+    def _visual_pos(self, index: QModelIndex) -> tuple[int, int]:
+        """Return (row, col) in the visual grid for a model index."""
+        rect = self.rectForIndex(index)
+        if rect.isNull():
+            return (-1, -1)
+        grid = self.gridSize()
+        if grid.width() <= 0 or grid.height() <= 0:
+            return (-1, -1)
+        col = int(rect.center().x() / grid.width())
+        row = int(rect.center().y() / grid.height())
+        return (row, col)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            index = self.indexAt(event.pos())
+            if index.isValid():
+                if event.modifiers() & Qt.ShiftModifier:
+                    if self._anchor_visual_row is not None:
+                        self._select_rectangular(index)
+                        return
+                else:
+                    r, c = self._visual_pos(index)
+                    self._anchor_visual_row = r
+                    self._anchor_visual_col = c
+        super().mousePressEvent(event)
+
+    def _select_rectangular(self, target: QModelIndex) -> None:
+        """Select all items in the visual rectangle between anchor and target."""
+        anchor_row = self._anchor_visual_row
+        anchor_col = self._anchor_visual_col
+        if anchor_row is None or anchor_col is None:
+            return
+        target_row, target_col = self._visual_pos(target)
+        if target_row < 0 or target_col < 0:
+            return
+
+        min_row = min(anchor_row, target_row)
+        max_row = max(anchor_row, target_row)
+        min_col = min(anchor_col, target_col)
+        max_col = max(anchor_col, target_col)
+
+        sel_model = self.selectionModel()
+        sel_model.clear()
+        model = self.model()
+        for i in range(model.rowCount()):
+            idx = model.index(i, 0)
+            r, c = self._visual_pos(idx)
+            if min_row <= r <= max_row and min_col <= c <= max_col:
+                sel_model.select(idx, sel_model.Select)
+        self.setCurrentIndex(target)
 
 
 def elide(text: str, limit: int) -> str:
@@ -357,6 +410,10 @@ class SettingsDialog(QDialog):
             QPushButton:hover {{
                 background: #3a71c6;
                 border-color: #3a71c6;
+            }}
+            QPushButton:pressed {{
+                background: #1e4a9a;
+                border-color: #1e4a9a;
             }}
             """
         )
@@ -1255,6 +1312,10 @@ class RandomGenerationDialog(QDialog):
             QPushButton:hover {{
                 background: #3a71c6;
                 border-color: #3a71c6;
+            }}
+            QPushButton:pressed {{
+                background: #1e4a9a;
+                border-color: #1e4a9a;
             }}
             """
         )
@@ -2186,6 +2247,13 @@ class MainWindow(QMainWindow):
         # generate_missing_thumbnails 用のバッチワーカー（H1 修正）
         self._missing_thumb_thread: QThread | None = None
         self._missing_thumb_worker: "MissingThumbnailBatchWorker | None" = None
+        # 複数カード選択時のサムネイル生成キュー
+        # sd-webui API は単一画像生成しかサポートしないため、アプリ側で
+        # キューイングして順次生成する。
+        self._thumbnail_batch_queue: list[WildcardEntry] = []
+        self._thumbnail_batch_total: int = 0
+        self._thumbnail_batch_use_random: bool = False
+        self._thumbnail_batch_cancelled: bool = False
 
         self._fs_watcher = QFileSystemWatcher(self)
         self._fs_watcher.directoryChanged.connect(self._on_fs_directory_changed)
@@ -2272,6 +2340,10 @@ class MainWindow(QMainWindow):
             QPushButton:hover {{
                 background: #3a71c6;
                 border-color: #3a71c6;
+            }}
+            QPushButton:pressed {{
+                background: #1e4a9a;
+                border-color: #1e4a9a;
             }}
             QMenuBar {{
                 background: #11151b;
@@ -2381,6 +2453,10 @@ class MainWindow(QMainWindow):
             QPushButton:hover {
                 background: #2a2d32;
                 border-color: #3a4450;
+            }
+            QPushButton:pressed {
+                background: #14171c;
+                border-color: #1e2430;
             }
         """ % (TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE)
 
@@ -2652,6 +2728,7 @@ class MainWindow(QMainWindow):
             "QPushButton { background: #6a2a2a; border: 1px solid #8a3a3a; border-radius: 6px;"
             " color: #ffcccc; font-size: 11px; padding: 0 10px; }"
             "QPushButton:hover { background: #8a3a3a; }"
+            "QPushButton:pressed { background: #4a1a1a; border-color: #6a2a2a; }"
             "QPushButton:disabled { background: #3a2a2a; color: #6a5a5a; }"
         )
         self.delete_tags_button.setEnabled(False)
@@ -2703,6 +2780,7 @@ class MainWindow(QMainWindow):
         self.setStatusBar(status_bar)
 
         self.card_view.selectionModel().currentChanged.connect(self._on_card_selection_changed)
+        self.card_view.selectionModel().selectionChanged.connect(self._update_selection_count)
         self._update_view_sizes()
         self.statusBar().showMessage("起動準備完了", 2000)
 
@@ -3013,10 +3091,21 @@ class MainWindow(QMainWindow):
         self.result_count_label.setText(f"{count} 件")
         folder_info = self.current_folder_prefix or "すべて"
         thumb_count = sum(1 for e in self.filtered_entries if e.has_thumbnail)
+        selected = len(self.card_view.selectionModel().selectedIndexes()) if self.card_view.selectionModel() else 0
+        selected_unique = len(set(
+            self.list_model.entry_at(idx).abs_path
+            for idx in self.card_view.selectionModel().selectedIndexes()
+            if self.list_model.entry_at(idx) is not None
+        )) if self.card_view.selectionModel() else 0
+        selection_str = f" | 選択: {selected_unique}" if selected_unique > 0 else ""
         self.statusBar().showMessage(
-            f"{count}件表示中 | フォルダ: {folder_info} | サムネ: {thumb_count}/{count}",
+            f"{count}件表示中{selection_str} | フォルダ: {folder_info} | サムネ: {thumb_count}/{count}",
             0
         )
+
+    def _update_selection_count(self) -> None:
+        """選択数が変わった時にステータスバーの選択表示を更新する。"""
+        self._set_result_count_label(len(self.filtered_entries))
 
     def _refresh_path_label(self) -> None:
         # L9 修正: _path_label_text は _build_ui で確実に初期化されるため、
@@ -4440,16 +4529,42 @@ class MainWindow(QMainWindow):
 
     def _on_thumbnail_generation_finished(self, updated: WildcardEntry, filename: str) -> None:
         self._stop_thumbnail_loading_feedback()
+        # 現在のカードのサムネイルを即時更新
         self._replace_entry(updated)
-        self.statusBar().showMessage(f"サムネイルを生成しました: {filename}", 5000)
+        done = self._thumbnail_batch_total - len(self._thumbnail_batch_queue)
+        if self._thumbnail_batch_total > 1:
+            self.statusBar().showMessage(
+                f"サムネイル生成中... ({done}/{self._thumbnail_batch_total}) 完了: {filename}",
+                3000,
+            )
+        else:
+            self.statusBar().showMessage(f"サムネイルを生成しました: {filename}", 5000)
         self._cleanup_thumbnail_generation_worker()
+        # バッチキューに残りがあれば次を開始
+        if self._thumbnail_batch_queue and not self._thumbnail_batch_cancelled:
+            QTimer.singleShot(100, self._start_next_thumbnail_in_batch)
+        elif self._thumbnail_batch_total > 1 or self._thumbnail_batch_cancelled:
+            self._finish_thumbnail_batch()
 
     def _on_thumbnail_generation_failed(self, message: str) -> None:
         self._stop_thumbnail_loading_feedback()
-        self._show_error("サムネイル生成エラー", message)
-        if self.current_entry is not None:
-            self._show_entry(self.current_entry)
+        # バッチ中はエラーダイアログをスキップして次へ進む（連続ダイアログ防止）
+        if self._thumbnail_batch_total > 1:
+            done = self._thumbnail_batch_total - len(self._thumbnail_batch_queue) - 1
+            self.statusBar().showMessage(
+                f"サムネイル生成失敗 ({done+1}/{self._thumbnail_batch_total}): {message}",
+                5000,
+            )
+        else:
+            self._show_error("サムネイル生成エラー", message)
+            if self.current_entry is not None:
+                self._show_entry(self.current_entry)
         self._cleanup_thumbnail_generation_worker()
+        # バッチキューに残りがあれば次を開始（キャンセル時は停止）
+        if self._thumbnail_batch_queue and not self._thumbnail_batch_cancelled:
+            QTimer.singleShot(100, self._start_next_thumbnail_in_batch)
+        elif self._thumbnail_batch_total > 1 or self._thumbnail_batch_cancelled:
+            self._finish_thumbnail_batch()
 
     def _choose_import_conflict_policy(self, title: str, message: str) -> str | None:
         dialog = ImportOptionsDialog(title, message, self)
@@ -4546,24 +4661,108 @@ class MainWindow(QMainWindow):
         return box.clickedButton() is btn_yes
 
     def generate_thumbnail_for_current(self) -> None:
-        if not self.current_entry:
-            self._show_info("サムネ生成", "先に wildcard を選択してください。")
-            return
+        """選択中のカード（単数または複数）のサムネイルを生成する。
+
+        複数カードが選択されている場合はキューに積んで順次生成する。
+        sd-webui API は単一画像生成しかサポートしないため、アプリ側で
+        キューイングして1枚ずつ処理する。
+        """
         if self.thumbnail_generation_thread is not None and self.thumbnail_generation_thread.isRunning():
             self._show_info("サムネ生成", "別のサムネ生成が実行中です。")
             return
+
+        # 選択中の全エントリを取得
+        indexes = self.card_view.selectionModel().selectedIndexes()
+        selected_entries: list[WildcardEntry] = []
+        if indexes:
+            seen_paths: set[str] = set()
+            for idx in indexes:
+                e = self.list_model.entry_at(idx)
+                if e is not None and e.abs_path not in seen_paths:
+                    seen_paths.add(e.abs_path)
+                    selected_entries.append(e)
+
+        # 選択がない場合は現在のエントリのみ
+        if not selected_entries:
+            if not self.current_entry:
+                self._show_info("サムネ生成", "先に wildcard を選択してください。")
+                return
+            selected_entries = [self.current_entry]
+
+        # ランダムワイルドカード使用可否は1回だけ尋ねる
         use_random = self._ask_use_random_wildcard()
+
+        # バッチ状態を初期化
+        self._thumbnail_batch_queue = list(selected_entries)
+        self._thumbnail_batch_total = len(selected_entries)
+        self._thumbnail_batch_use_random = use_random
+        self._thumbnail_batch_cancelled = False
+
+        # 最初の1枚を開始
+        self._start_next_thumbnail_in_batch()
+
+    def _start_next_thumbnail_in_batch(self) -> None:
+        """バッチキューから次の1枚を取り出してサムネイル生成を開始する。"""
+        # キャンセルチェック
+        if self._thumbnail_batch_cancelled:
+            self._finish_thumbnail_batch()
+            return
+
+        # キューが空ならバッチ終了
+        if not self._thumbnail_batch_queue:
+            self._finish_thumbnail_batch()
+            return
+
+        # まだ生成スレッドが動いている場合は何もしない（二重起動防止）
+        if self.thumbnail_generation_thread is not None and self.thumbnail_generation_thread.isRunning():
+            return
+
+        # 次のエントリを取り出す
+        entry = self._thumbnail_batch_queue.pop(0)
+        # 既に current_entry になっているエントリでなくても生成可能
+        # （右パネルの表示は現在の選択を維持するため、current_entry は更新しない）
+
+        # 進捗表示
+        done = self._thumbnail_batch_total - len(self._thumbnail_batch_queue)
+        if self._thumbnail_batch_total > 1:
+            msg = f"Generating thumbnail... ({done}/{self._thumbnail_batch_total})\n{entry.stem}"
+        else:
+            msg = "Generating thumbnail...\nPreparing image..."
+        self._start_thumbnail_loading_feedback(msg)
+        self.statusBar().showMessage(
+            f"Generating thumbnail... ({done}/{self._thumbnail_batch_total})" if self._thumbnail_batch_total > 1 else "Generating thumbnail...",
+            0,
+        )
+
         worker_settings = copy.copy(self.settings)
-        worker_settings.thumbnail_random_wildcard = use_random
-        self._start_thumbnail_loading_feedback("Generating thumbnail...\nPreparing image...")
-        self.statusBar().showMessage("Generating thumbnail...", 0)
+        worker_settings.thumbnail_random_wildcard = self._thumbnail_batch_use_random
         self.thumbnail_generation_thread = QThread(self)
-        self.thumbnail_generation_worker = SingleThumbnailWorker(self.db_path, worker_settings, self.current_entry)
+        self.thumbnail_generation_worker = SingleThumbnailWorker(self.db_path, worker_settings, entry)
         self.thumbnail_generation_worker.moveToThread(self.thumbnail_generation_thread)
         self.thumbnail_generation_thread.started.connect(self.thumbnail_generation_worker.run)
         self.thumbnail_generation_worker.finished.connect(self._on_thumbnail_generation_finished)
         self.thumbnail_generation_worker.failed.connect(self._on_thumbnail_generation_failed)
         self.thumbnail_generation_thread.start()
+
+    def _finish_thumbnail_batch(self) -> None:
+        """バッチ生成の終了処理。キューと状態をクリアする。"""
+        self._stop_thumbnail_loading_feedback()
+        total = self._thumbnail_batch_total
+        cancelled = self._thumbnail_batch_cancelled
+        self._thumbnail_batch_queue = []
+        self._thumbnail_batch_total = 0
+        self._thumbnail_batch_use_random = False
+        self._thumbnail_batch_cancelled = False
+        if total > 1:
+            if cancelled:
+                self.statusBar().showMessage("サムネイル生成を中断しました", 5000)
+            else:
+                self.statusBar().showMessage(f"{total} 件のサムネイルを生成しました", 5000)
+
+    def _cancel_thumbnail_batch(self) -> None:
+        """バッチ生成をキャンセルする（現在の生成の完了後に停止）。"""
+        self._thumbnail_batch_cancelled = True
+        self._thumbnail_batch_queue = []
 
     def generate_missing_thumbnails(self) -> None:
         """不足分サムネイルをバックグラウンドワーカーで生成する（H1 修正）。
@@ -4716,6 +4915,8 @@ class MainWindow(QMainWindow):
         if not self._confirm_discard_or_save_if_needed():
             event.ignore()
             return
+        # サムネイルバッチ生成をキャンセル
+        self._cancel_thumbnail_batch()
         # Let outstanding thumbnail/content jobs finish cleanly so they do not
         # emit into deleted QObject signal sources during shutdown.
         self._api_monitor.stop()
