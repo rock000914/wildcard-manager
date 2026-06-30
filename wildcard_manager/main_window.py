@@ -238,6 +238,11 @@ class SlowWheelListView(QListView):
         self._anchor_visual_row: int | None = None
         self._anchor_visual_col: int | None = None
 
+    def setModel(self, model) -> None:
+        super().setModel(model)
+        self._anchor_visual_row = None
+        self._anchor_visual_col = None
+
     def wheelEvent(self, event) -> None:
         delta = event.angleDelta().y()
         if delta == 0:
@@ -268,7 +273,7 @@ class SlowWheelListView(QListView):
                     if self._anchor_visual_row is not None:
                         self._select_rectangular(index)
                         return
-                else:
+                elif not (event.modifiers() & Qt.ControlModifier):
                     r, c = self._visual_pos(index)
                     self._anchor_visual_row = r
                     self._anchor_visual_col = c
