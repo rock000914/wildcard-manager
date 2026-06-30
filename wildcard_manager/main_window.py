@@ -3963,6 +3963,41 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._show_error("削除エラー", str(exc))
 
+    def _rename_card(self, entry: WildcardEntry) -> None:
+        old_name = entry.stem
+        new_name, ok = QInputDialog.getText(
+            self, "名前を変更", "新しい名前:", text=old_name
+        )
+        if not ok or not new_name.strip() or new_name.strip() == old_name:
+            return
+        new_name = new_name.strip()
+        try:
+            src_txt = Path(entry.abs_path)
+            src_sidecar = sidecar_metadata_path(src_txt)
+            src_thumb = Path(entry.thumbnail_path) if entry.thumbnail_path else None
+
+            new_txt = src_txt.with_stem(new_name)
+            new_sidecar = sidecar_metadata_path(new_txt)
+            new_thumb = src_thumb.with_stem(new_name) if src_thumb else None
+
+            if new_txt.exists() and new_txt != src_txt:
+                QMessageBox.warning(self, "名前変更エラー", f"同名のファイルが既に存在します:\n{new_txt.name}")
+                return
+
+            src_txt.rename(new_txt)
+            if src_sidecar.exists():
+                src_sidecar.rename(new_sidecar)
+            if src_thumb and src_thumb.exists():
+                src_thumb.rename(new_thumb)
+
+            self.repo.delete_entry(entry.abs_path)
+            self.repo.refresh_entry(self.settings, new_txt)
+
+            self.load_cached_entries()
+            self.statusBar().showMessage(f"名前を '{new_name}' に変更しました。", 6000)
+        except Exception as exc:
+            QMessageBox.critical(self, "リネームエラー", str(exc))
+
     def _move_to_trash(self, path: Path) -> bool:
         try:
             if not path.exists():
@@ -4260,6 +4295,7 @@ class MainWindow(QMainWindow):
         explorer_action = menu.addAction("エクスプローラーで開く")
         thumb_folder_action = menu.addAction("サムネフォルダを開く")
         menu.addSeparator()
+        rename_action = menu.addAction("名前を変更...")
         move_action = menu.addAction("移動...")
         menu.addSeparator()
         delete_action = menu.addAction("削除")
@@ -4278,6 +4314,8 @@ class MainWindow(QMainWindow):
             self._open_in_explorer(entry)
         elif action == thumb_folder_action:
             self._open_thumbnail_folder(entry)
+        elif action == rename_action:
+            self._rename_card(entry)
         elif action == move_action:
             self._show_move_folder_dialog()
         elif action == delete_action:
