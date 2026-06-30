@@ -235,13 +235,11 @@ class SlowWheelListView(QListView):
     def __init__(self, scroll_step: int = 30, parent=None):
         super().__init__(parent)
         self.scroll_step = scroll_step
-        self._anchor_visual_row: int | None = None
-        self._anchor_visual_col: int | None = None
+        self._anchor_index: QModelIndex | None = None
 
     def setModel(self, model) -> None:
         super().setModel(model)
-        self._anchor_visual_row = None
-        self._anchor_visual_col = None
+        self._anchor_index = None
 
     def wheelEvent(self, event) -> None:
         delta = event.angleDelta().y()
@@ -261,8 +259,12 @@ class SlowWheelListView(QListView):
         grid = self.gridSize()
         if grid.width() <= 0 or grid.height() <= 0:
             return (-1, -1)
-        col = int(rect.center().x() / grid.width())
-        row = int(rect.center().y() / grid.height())
+        # rectForIndex returns viewport-relative coords;
+        # add scroll offsets to get content-relative coords.
+        content_x = rect.center().x() + self.horizontalScrollBar().value()
+        content_y = rect.center().y() + self.verticalScrollBar().value()
+        col = int(content_x / grid.width())
+        row = int(content_y / grid.height())
         return (row, col)
 
     def mousePressEvent(self, event) -> None:
@@ -270,23 +272,20 @@ class SlowWheelListView(QListView):
             index = self.indexAt(event.pos())
             if index.isValid():
                 if event.modifiers() & Qt.ShiftModifier:
-                    if self._anchor_visual_row is not None:
+                    if self._anchor_index is not None and self._anchor_index.isValid():
                         self._select_rectangular(index)
                         return
                 elif not (event.modifiers() & Qt.ControlModifier):
-                    r, c = self._visual_pos(index)
-                    self._anchor_visual_row = r
-                    self._anchor_visual_col = c
+                    self._anchor_index = index
         super().mousePressEvent(event)
 
     def _select_rectangular(self, target: QModelIndex) -> None:
         """Select all items in the visual rectangle between anchor and target."""
-        anchor_row = self._anchor_visual_row
-        anchor_col = self._anchor_visual_col
-        if anchor_row is None or anchor_col is None:
+        if self._anchor_index is None or not self._anchor_index.isValid():
             return
+        anchor_row, anchor_col = self._visual_pos(self._anchor_index)
         target_row, target_col = self._visual_pos(target)
-        if target_row < 0 or target_col < 0:
+        if anchor_row < 0 or target_row < 0:
             return
 
         min_row = min(anchor_row, target_row)
