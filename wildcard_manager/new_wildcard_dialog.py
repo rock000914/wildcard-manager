@@ -680,6 +680,7 @@ class CharacterTabContent(QWidget):
         tag_header.setContentsMargins(0, 0, 0, 0)
         tag_header.setSpacing(4)
         self.tag_editor = TagEditorWidget()
+        self.tag_editor.help_label.hide()
         self.tag_editor.tagsChanged.connect(self._on_tags_changed)
         self.tag_editor.tagClicked.connect(self._on_tag_clicked)
         self.btn_delete_mode = QPushButton("削除モード")
@@ -692,7 +693,6 @@ class CharacterTabContent(QWidget):
         self.btn_delete_selected.setMinimumWidth(70)
         self.btn_delete_selected.setVisible(False)
         self.btn_delete_selected.clicked.connect(self._delete_selected_tags)
-        tag_header.addWidget(self.tag_editor.help_label)
         tag_header.addStretch(1)
         tag_header.addWidget(self.btn_delete_selected)
         tag_header.addWidget(self.btn_delete_mode)
@@ -952,17 +952,40 @@ class CharacterTabContent(QWidget):
     def _toggle_delete_mode(self, checked: bool):
         if checked:
             self.tag_editor.set_editable(True)
+            self.btn_delete_mode.setStyleSheet(
+                "QPushButton { background: #8b2020; color: #ffcccc; border: 1px solid #cc4444; border-radius: 4px; }"
+            )
+            self.tag_editor.border_frame.setStyleSheet(
+                "#tagBorderFrame {"
+                " background: #1a1015;"
+                f" border: {self.tag_editor._BORDER_WIDTH}px solid #cc4444;"
+                " border-radius: 8px;"
+                "}"
+            )
+            self.btn_delete_selected.setVisible(True)
         else:
             self.tag_editor.set_editable(False)
-        self.btn_delete_selected.setVisible(False)
+            self.btn_delete_mode.setStyleSheet("")
+            self.tag_editor.border_frame.setStyleSheet(
+                "#tagBorderFrame {"
+                " background: #121a27;"
+                f" border: {self.tag_editor._BORDER_WIDTH}px solid #2f5274;"
+                " border-radius: 8px;"
+                "}"
+            )
+            self.btn_delete_selected.setVisible(False)
 
     def _delete_selected_tags(self):
+        if not self.tag_editor.has_selected_tags():
+            # 選択がない場合は保存しない（削除モードを解除するだけ）
+            self.btn_delete_mode.setChecked(False)
+            return
         self.tag_editor.delete_selected_tags()
-        self.btn_delete_selected.setVisible(False)
+        self.btn_delete_mode.setChecked(False)
 
     def _update_delete_button_state(self):
-        if self.tag_editor._select_mode:
-            self.btn_delete_selected.setVisible(self.tag_editor.has_selected_tags())
+        # 削除モード中は常に「選択削除」ボタンを表示
+        pass
 
     def _on_tag_clicked(self, tag: str):
         if not self.tag_editor._select_mode:
@@ -1001,18 +1024,6 @@ class CharacterTabContent(QWidget):
             "background:#121a27;border:1px solid #2a3440;border-radius:6px;"
         )
 
-    def _animate_button_press(self):
-        if not self._btn_gen:
-            return
-        self._btn_gen.setStyleSheet(
-            "QPushButton{background:#1a3a6a;border:1px solid #1a3a6a;border-radius:4px;color:white;padding:0 10px;font-size:12px;min-height:32px}"
-        )
-        QTimer.singleShot(100, self._reset_button_style)
-
-    def _reset_button_style(self):
-        if self._btn_gen:
-            self._btn_gen.setStyleSheet("")
-
     def _start_thumb_loading_animation(self, message: str = "サムネイル生成中..."):
         self._thumb_loading_active = True
         self._thumb_loading_frame = 0
@@ -1043,7 +1054,6 @@ class CharacterTabContent(QWidget):
     def _gen_thumb(self):
         if self._thumb_thread and self._thumb_thread.isRunning():
             return
-        self._animate_button_press()
         name = self.inp_name.text().strip()
         if not name:
             QMessageBox.warning(self, "エラー", "ファイル名を入力してください。"); return
@@ -1385,6 +1395,7 @@ class NewWildcardDialog(QDialog):
             QGroupBox::title{subcontrol-origin:margin;left:8px;padding:0 4px}
             QPushButton{background:#2e5fb8;border:1px solid #2e5fb8;border-radius:4px;color:white;padding:0 10px;font-size:12px}
             QPushButton:hover{background:#3a71c6;border-color:#3a71c6}
+            QPushButton:pressed{background:#1e4a9a;border-color:#1e4a9a}
             QListWidget{background:#161b22;border:1px solid #2a3440;border-radius:4px;color:#edf2f7;font-size:12px}
             QListWidget{font-size:13px}
             QListWidget::item{padding:4px 8px}
@@ -1496,6 +1507,9 @@ class NewWildcardDialog(QDialog):
         )
         self._json_overlay.hide()
 
+        # 初期スナップショット（変更検知用）
+        self._update_baseline_snapshot()
+
     def _on_character_folder_changed(self, text: str):
         path = text.strip()
         if path:
@@ -1524,10 +1538,12 @@ class NewWildcardDialog(QDialog):
         cm_info = lora_path.parent / f"{lora_name}.cm-info.json"
         if cm_info.exists():
             if not self.import_json_path(str(cm_info)):
+                self._show_toast("インポートがキャンセルされました")
                 return
             self._current_unmade_item = item_data
         else:
             if not self._confirm_discard_changes():
+                self._show_toast("インポートがキャンセルされました")
                 return
             self._current_unmade_item = item_data
             tab = self._current_tab_content()
@@ -1682,27 +1698,36 @@ class NewWildcardDialog(QDialog):
 
         # トリガーワード
         trained: list[str] = [str(t).strip() for t in (data.get("TrainedWords") or []) if str(t).strip()]
+        tab._costumes.clear()
+        tab.costume_list.clear()
+        tab._prev_costume_row = -1
+
+        for i, prompt_text in enumerate(trained, 1):
+            tab._costumes.append({"name": f"{i}", "prompt": prompt_text, "tags": []})
+            tab.costume_list.addItem(f"{i}")
+
         if trained:
-            tab._costumes.clear()
-            tab.costume_list.clear()
-            tab._prev_costume_row = -1
-
-            for i, prompt_text in enumerate(trained, 1):
-                tab._costumes.append({"name": f"{i}", "prompt": prompt_text, "tags": []})
-                tab.costume_list.addItem(f"{i}")
-
             tab.costume_list.setCurrentRow(0)
             tab._prev_costume_row = 0
             tab._load_detail(0)
-            tab._update_expand_merge_state()
+        else:
+            tab.inp_cname.setText("")
+            tab.inp_prompt.blockSignals(True)
+            tab.inp_prompt.setPlainText("")
+            tab.inp_prompt.blockSignals(False)
+            tab._sync_prompt_to_tags()
+            tab._clear_thumb_pixmap()
+        tab._update_expand_merge_state()
 
         tags = data.get("Tags", [])
 
         imported = []
         if char_name:  imported.append(f"キャラ名: {char_name}")
         if lora_stem:  imported.append(f"LoRA: <lora:{lora_stem}:1>")
-        if trained:    imported.append(f"カード: {len(trained)}件")
-        if tags:       imported.append(f"タグ: {len(tags)}件")
+        if trained:
+            imported.append(f"TrainedWords: {len(trained)}件")
+        else:
+            imported.append("TrainedWords: なし")
         msg = "\n".join(imported) if imported else "インポート可能なデータが見つかりませんでした"
         self._show_toast(f"JSONインポート完了\n{msg}")
         self._update_baseline_snapshot()
@@ -1898,6 +1923,12 @@ class NewWildcardDialog(QDialog):
         tab = self._current_tab_content()
         if not tab:
             return
+        # 変更がない場合は保存しない
+        if self._baseline_snapshot is not None:
+            current = self._capture_form_snapshot()
+            if current == self._baseline_snapshot:
+                self.accept()
+                return
         entries = tab.create_entries()
         if entries:
             self.created_entries.extend(entries)

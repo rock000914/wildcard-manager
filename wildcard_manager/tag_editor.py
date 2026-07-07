@@ -27,6 +27,13 @@ class FlowLayout(QLayout):
 
     def addItem(self, item) -> None:
         self._items.append(item)
+        # addWidget() は内部でこの addItem() を呼ぶだけで、Qtに対して
+        # 「レイアウトが変わったので再計算が必要」と知らせる invalidate() を
+        # 自動では呼ばない。これを怠ると、QScrollArea(setWidgetResizable(True))
+        # 側がコンテンツサイズの変化に気づかず再配置されない
+        # （ウィンドウをリサイズした時だけ setGeometry() 経由で正しく表示される）
+        # という不具合になるため、明示的に invalidate() してレイアウト要求を発行する。
+        self.invalidate()
 
     def count(self) -> int:
         return len(self._items)
@@ -36,13 +43,16 @@ class FlowLayout(QLayout):
 
     def takeAt(self, index: int):
         if 0 <= index < len(self._items):
-            return self._items.pop(index)
+            item = self._items.pop(index)
+            self.invalidate()
+            return item
         return None
 
     def removeWidget(self, widget) -> None:
         for i, item in enumerate(self._items):
             if item.widget() is widget:
                 self._items.pop(i)
+                self.invalidate()
                 return
 
     def expandingDirections(self):
@@ -141,11 +151,21 @@ class TagChip(QWidget):
     def is_selected(self) -> bool:
         return self._selected
 
+    def _is_lora_tag(self) -> bool:
+        """LoRAタグかどうかを判定"""
+        tag = self.tag.strip()
+        return tag.startswith("<lora:") or tag.startswith("<lyco:")
+
     def _update_style(self) -> None:
         if self._selected:
             bg = "#5a2020"
             border = "#b84040"
             text_color = "#ffaaaa"
+        elif self._is_lora_tag():
+            # LoRAタグ: 明るい緑色
+            bg = "#1a3a1a"
+            border = "#3a8a3a"
+            text_color = "#55dd55"
         else:
             bg = "#1e2d3d"
             border = "#3a5068"
@@ -193,7 +213,7 @@ class TagEditorWidget(QWidget):
         self._overflow_label: QLabel | None = None
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
 
-        self.help_label = QLabel("タグ一覧（ダブルクリックで編集）")
+        self.help_label = QLabel("タグ一覧")
         self.help_label.setStyleSheet("color: #9fb2c7; padding: 0 2px 4px 2px;")
 
         self.scroll_area = QScrollArea()
@@ -251,7 +271,6 @@ class TagEditorWidget(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(4)
-        outer.addWidget(self.help_label)
         outer.addWidget(self.border_frame)
 
         self._refresh_empty_state()
@@ -306,6 +325,20 @@ class TagEditorWidget(QWidget):
         else:
             self._enter_select_mode()
 
+    def set_delete_mode_border(self, active: bool) -> None:
+        """削除モードに応じてタグエリアの枠線色を変更する"""
+        if active:
+            border_color = "#b84040"
+        else:
+            border_color = "#2f5274"
+        self.border_frame.setStyleSheet(
+            "#tagBorderFrame {"
+            " background: #121a27;"
+            f" border: {self._BORDER_WIDTH}px solid {border_color};"
+            " border-radius: 8px;"
+            "}"
+        )
+
     def _append_tag(self, tag: str) -> None:
         clean = tag.strip()
         if not clean or clean in self._tag_set:
@@ -318,6 +351,13 @@ class TagEditorWidget(QWidget):
         self._tag_set.add(clean)
         chip.set_select_mode(self._select_mode)
         chip.show()
+        # NOTE: addWidget() 内の addItem() が呼ぶ invalidate() は、この時点では
+        # まだ chip.show() 前なので isVisible()==False。FlowLayout._do_layout() は
+        # 「まだ表示されていないウィジェット」を (-9999, -9999) へ移動してスキップする
+        # 仕様のため、show() 前に走るレイアウトパスでは新規チップが画面外に飛ばされて
+        # しまう。show() の後にもう一度 invalidate() して、表示済み状態で
+        # 正しく再レイアウトされるようにする。
+        self.flow_layout.invalidate()
         self._refresh_empty_state()
         self.tagsChanged.emit()
 
@@ -346,13 +386,11 @@ class TagEditorWidget(QWidget):
 
     def _enter_select_mode(self) -> None:
         self._select_mode = True
-        self.help_label.setText("タグを選択して削除（ダブルクリックで編集）")
         for chip in self._chips:
             chip.set_select_mode(True)
 
     def _exit_select_mode(self) -> None:
         self._select_mode = False
-        self.help_label.setText("タグ一覧（ダブルクリックで編集）")
         for chip in self._chips:
             chip.set_select_mode(False)
 
