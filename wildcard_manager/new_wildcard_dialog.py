@@ -1923,12 +1923,6 @@ class NewWildcardDialog(QDialog):
         tab = self._current_tab_content()
         if not tab:
             return
-        # 変更がない場合は保存しない
-        if self._baseline_snapshot is not None:
-            current = self._capture_form_snapshot()
-            if current == self._baseline_snapshot:
-                self.accept()
-                return
         entries = tab.create_entries()
         if entries:
             self.created_entries.extend(entries)
