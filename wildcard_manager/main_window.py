@@ -4451,13 +4451,17 @@ class MainWindow(QMainWindow):
             return
         thumb_path = Path(entry.thumbnail_path)
         if thumb_path.exists():
-            open_in_file_manager(thumb_path, select=True)
+            ok = open_in_file_manager(thumb_path, select=True)
+            if not ok:
+                self._show_info("サムネフォルダ", f"エクスプローラーの起動に失敗しました:\n{thumb_path}")
         else:
             parent = thumb_path.parent
             if parent.exists():
-                open_in_file_manager(parent)
+                ok = open_in_file_manager(parent)
+                if not ok:
+                    self._show_info("サムネフォルダ", f"エクスプローラーの起動に失敗しました:\n{parent}")
             else:
-                self._show_info("サムネフォルダ", f"サムネイルフォルダが見つかりません:\n{parent}")
+                self._show_info("サムネフォルダ", f"サムネイルフォルダが見つかりません:\n{thumb_path}\n\n親フォルダも存在しません:\n{parent}")
 
     def _sync_editor_from_prompt_tags(self) -> None:
         text = ", ".join(self.prompt_tags_edit.tags())
