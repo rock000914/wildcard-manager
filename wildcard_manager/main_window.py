@@ -4370,7 +4370,6 @@ class MainWindow(QMainWindow):
         tree.addTopLevelItem(root)
 
         self._populate_folder_tree_items(root, "")
-        tree.expandAll()
 
         layout.addWidget(tree)
 
