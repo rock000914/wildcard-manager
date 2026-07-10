@@ -4374,12 +4374,12 @@ class MainWindow(QMainWindow):
         layout.addWidget(tree)
 
         button_layout = QHBoxLayout()
-        cancel_btn = QPushButton("キャンセル")
         move_btn = QPushButton("移動")
+        cancel_btn = QPushButton("キャンセル")
         move_btn.setDefault(True)
+        button_layout.addStretch()
         button_layout.addWidget(move_btn)
         button_layout.addWidget(cancel_btn)
-        button_layout.addStretch()
         layout.addLayout(button_layout)
 
         cancel_btn.clicked.connect(dialog.reject)
