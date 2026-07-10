@@ -4311,7 +4311,6 @@ class MainWindow(QMainWindow):
                 action = search_menu.addAction(name)
                 action.triggered.connect(lambda checked=False, n=name: self._check_lora_in_cloud(n))
         menu.addSeparator()
-        folder_action = menu.addAction("フォルダを開く")
         explorer_action = menu.addAction("エクスプローラーで開く")
         thumb_folder_action = menu.addAction("サムネフォルダを開く")
         menu.addSeparator()
@@ -4328,8 +4327,6 @@ class MainWindow(QMainWindow):
             self.copy_all_text(True)
         elif action == copy_all_without_action:
             self.copy_all_text(False)
-        elif action == folder_action:
-            self._navigate_to_entry_folder(entry)
         elif action == explorer_action:
             self._open_in_explorer(entry)
         elif action == thumb_folder_action:
@@ -4424,17 +4421,6 @@ class MainWindow(QMainWindow):
         action = menu.exec(self.lora_list.viewport().mapToGlobal(pos))
         if action == filter_action:
             self._check_lora_in_cloud(item.text())
-
-    def _navigate_to_entry_folder(self, entry: WildcardEntry) -> None:
-        folder = entry.folder
-        if not folder:
-            self.folder_tree.setCurrentItem(self.folder_tree.topLevelItem(0))
-            return
-        self._ensure_folder_path(folder)
-        item = self._find_folder_item(folder)
-        if item:
-            self.folder_tree.setCurrentItem(item)
-            self.folder_tree.scrollToItem(item)
 
     def _open_in_explorer(self, entry: WildcardEntry) -> None:
         from .ui_utils import open_in_file_manager

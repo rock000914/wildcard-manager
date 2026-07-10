@@ -67,36 +67,16 @@ def open_in_file_manager(path: Path | str, *, select: bool = False) -> bool:
 
     Windows では ``explorer.exe /select,path`` 相当、それ以外では
     ``xdg-open`` (Linux) / ``open`` (macOS) を使う。失敗時は False を返す。
-
-    【WinError 6 対策】Windows で subprocess.Popen が親プロセスの不要なハンドルを
-    引き継いでしまうと「ハンドルが無効です」エラーが出ることがあるため、
-    close_fds=True を明示し、標準ハンドルを DEVNULL に向ける。
-    また STARTUPINFO を渡してコンソールウィンドウを抑制する。
     """
     p = Path(path)
     if sys.platform == "win32":
         import subprocess
         try:
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            path_str = str(p)
             if select and p.exists():
-                subprocess.Popen(
-                    ["explorer.exe", "/select,", str(p)],
-                    close_fds=True,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    startupinfo=startupinfo,
-                )
+                subprocess.Popen(f'explorer.exe /select,"{path_str}"', shell=True)
             elif p.exists():
-                subprocess.Popen(
-                    ["explorer.exe", str(p)],
-                    close_fds=True,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    startupinfo=startupinfo,
-                )
+                subprocess.Popen(["explorer.exe", path_str])
             else:
                 return False
             return True
