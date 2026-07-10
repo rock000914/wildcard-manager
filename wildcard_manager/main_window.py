@@ -4358,18 +4358,23 @@ class MainWindow(QMainWindow):
         dialog = QDialog(self)
         dialog.setWindowTitle("移動先のフォルダを選択")
         dialog.setMinimumSize(350, 450)
+        dialog.setStyleSheet(self.styleSheet())
 
         layout = QVBoxLayout(dialog)
 
         tree = QTreeWidget()
         tree.setHeaderHidden(True)
         tree.setRootIsDecorated(True)
+        tree.setIndentation(12)
+        tree.setAnimated(False)
+        tree.setExpandsOnDoubleClick(True)
 
         root = QTreeWidgetItem(["(all)"])
         root.setData(0, Qt.UserRole, "")
         tree.addTopLevelItem(root)
 
         self._populate_folder_tree_items(root, "")
+        tree.expandItem(root)
 
         layout.addWidget(tree)
 
