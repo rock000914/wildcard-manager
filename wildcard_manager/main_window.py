@@ -15,7 +15,7 @@ import uuid
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 
-from PySide6.QtCore import QFile, QModelIndex, QObject, QPoint, QRect, QRectF, QSignalBlocker, QSize, Qt, QThread, QThreadPool, QTimer, Signal, Slot, QEvent, QFileSystemWatcher
+from PySide6.QtCore import QFile, QItemSelection, QItemSelectionModel, QModelIndex, QObject, QPoint, QRect, QRectF, QSignalBlocker, QSize, Qt, QThread, QThreadPool, QTimer, Signal, Slot, QEvent, QFileSystemWatcher
 from PySide6.QtGui import QAction, QActionGroup, QClipboard, QCloseEvent, QColor, QFont, QFontMetrics, QIcon, QImage, QImageReader, QKeySequence, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -235,11 +235,14 @@ class SlowWheelListView(QListView):
     def __init__(self, scroll_step: int = 30, parent=None):
         super().__init__(parent)
         self.scroll_step = scroll_step
-        self._anchor_index: QModelIndex | None = None
+        self._anchor_row: int | None = None
+        # Shiftクリックを自前処理した直後、Qt標準のラバーバンド（矩形選択枠）が
+        # 一瞬表示されてしまうのを防ぐためのフラグ。
+        self._suppress_native_mouse: bool = False
 
     def setModel(self, model) -> None:
         super().setModel(model)
-        self._anchor_index = None
+        self._anchor_row = None
 
     def wheelEvent(self, event) -> None:
         delta = event.angleDelta().y()
@@ -251,57 +254,67 @@ class SlowWheelListView(QListView):
         bar.setValue(bar.value() - int(notches * self.scroll_step))
         event.accept()
 
-    def _visual_pos(self, index: QModelIndex) -> tuple[int, int]:
-        """Return (row, col) in the visual grid for a model index."""
-        rect = self.rectForIndex(index)
-        if rect.isNull():
-            return (-1, -1)
-        grid = self.gridSize()
-        if grid.width() <= 0 or grid.height() <= 0:
-            return (-1, -1)
-        # rectForIndex returns viewport-relative coords;
-        # add scroll offsets to get content-relative coords.
-        content_x = rect.center().x() + self.horizontalScrollBar().value()
-        content_y = rect.center().y() + self.verticalScrollBar().value()
-        col = int(content_x / grid.width())
-        row = int(content_y / grid.height())
-        return (row, col)
-
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.LeftButton:
             index = self.indexAt(event.pos())
             if index.isValid():
                 if event.modifiers() & Qt.ShiftModifier:
-                    if self._anchor_index is not None and self._anchor_index.isValid():
-                        self._select_rectangular(index)
+                    if self._anchor_row is not None:
+                        self._select_range(index)
+                        # super().mousePressEvent() を呼ばないため、Qt内部の
+                        # pressedPosition/state が更新されない。これを放置すると
+                        # 直後の mouseMoveEvent/mouseReleaseEvent で Qt が「ボタンを
+                        # 押したまま動いた」と誤認識し、ラバーバンド（矩形選択枠）が
+                        # 一瞬出てしまう。以降の move/release も自前で握りつぶす。
+                        self._suppress_native_mouse = True
+                        event.accept()
                         return
                 elif not (event.modifiers() & Qt.ControlModifier):
-                    self._anchor_index = index
+                    self._anchor_row = index.row()
+        self._suppress_native_mouse = False
         super().mousePressEvent(event)
 
-    def _select_rectangular(self, target: QModelIndex) -> None:
-        """Select all items in the visual rectangle between anchor and target."""
-        if self._anchor_index is None or not self._anchor_index.isValid():
+    def mouseMoveEvent(self, event) -> None:
+        if self._suppress_native_mouse:
+            event.accept()
             return
-        anchor_row, anchor_col = self._visual_pos(self._anchor_index)
-        target_row, target_col = self._visual_pos(target)
-        if anchor_row < 0 or target_row < 0:
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self._suppress_native_mouse:
+            self._suppress_native_mouse = False
+            event.accept()
             return
+        super().mouseReleaseEvent(event)
 
-        min_row = min(anchor_row, target_row)
-        max_row = max(anchor_row, target_row)
-        min_col = min(anchor_col, target_col)
-        max_col = max(anchor_col, target_col)
+    def _select_range(self, target: QModelIndex) -> None:
+        """アンカー行からターゲット行までを、表示順（モデルの行順）で連続選択する。
 
-        sel_model = self.selectionModel()
-        sel_model.clear()
+        Windows のシフトクリックと同様に、視覚的な行/列の矩形ではなく
+        一覧の並び順（モデル順）でアンカー〜クリック位置までを範囲選択する。
+        """
+        anchor_row = self._anchor_row
+        if anchor_row is None:
+            return
         model = self.model()
-        for i in range(model.rowCount()):
-            idx = model.index(i, 0)
-            r, c = self._visual_pos(idx)
-            if min_row <= r <= max_row and min_col <= c <= max_col:
-                sel_model.select(idx, sel_model.Select)
-        self.setCurrentIndex(target)
+        if model is None:
+            return
+        target_row = target.row()
+        if target_row < 0:
+            return
+
+        start_row = min(anchor_row, target_row)
+        end_row = max(anchor_row, target_row)
+
+        selection = QItemSelection(model.index(start_row, 0), model.index(end_row, 0))
+        sel_model = self.selectionModel()
+        sel_model.select(selection, QItemSelectionModel.ClearAndSelect)
+        # NOTE: self.setCurrentIndex(target) は使わない。
+        # QAbstractItemView.setCurrentIndex() は内部で selectionCommand(target, None) を
+        # 評価し直し、Shift押下を認識できないため ClearAndSelect 相当を再適用して
+        # 直前の範囲選択を消してしまう（選択されたりされなかったりする不具合の原因）。
+        # selectionModel.setCurrentIndex(..., NoUpdate) なら選択を変えずにフォーカスだけ移動する。
+        sel_model.setCurrentIndex(target, QItemSelectionModel.NoUpdate)
 
 
 def elide(text: str, limit: int) -> str:
@@ -4365,9 +4378,9 @@ class MainWindow(QMainWindow):
         cancel_btn = QPushButton("キャンセル")
         move_btn = QPushButton("移動")
         move_btn.setDefault(True)
-        button_layout.addStretch()
-        button_layout.addWidget(cancel_btn)
         button_layout.addWidget(move_btn)
+        button_layout.addWidget(cancel_btn)
+        button_layout.addStretch()
         layout.addLayout(button_layout)
 
         cancel_btn.clicked.connect(dialog.reject)
