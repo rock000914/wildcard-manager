@@ -4371,6 +4371,7 @@ class MainWindow(QMainWindow):
 
         root = QTreeWidgetItem(["(all)"])
         root.setData(0, Qt.UserRole, "")
+        root.setIcon(0, self.style().standardIcon(QStyle.SP_DirHomeIcon))
         tree.addTopLevelItem(root)
 
         self._populate_folder_tree_items(root, "")
@@ -4408,9 +4409,11 @@ class MainWindow(QMainWindow):
             child_key = child_name if not parent_key else f"{parent_key}/{child_name}"
             child_item = QTreeWidgetItem([child_name])
             child_item.setData(0, Qt.UserRole, child_key)
-            item.addChild(child_item)
+            child_item.setIcon(0, self.style().standardIcon(QStyle.SP_DirIcon))
             if self.folder_children_map.get(child_key):
-                self._populate_folder_tree_items(child_item, child_key)
+                child_item.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
+            item.addChild(child_item)
+            self._populate_folder_tree_items(child_item, child_key)
 
     def _show_lora_context_menu(self, pos) -> None:
         item = self.lora_list.itemAt(pos)
