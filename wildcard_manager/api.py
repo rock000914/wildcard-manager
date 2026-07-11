@@ -3,11 +3,14 @@ from __future__ import annotations
 import base64
 import io
 import json
+import logging
 import random
 from pathlib import Path
 from typing import Any
 
 import requests
+
+log = logging.getLogger(__name__)
 from PIL import Image
 
 from .models import AppSettings, WildcardEntry
@@ -56,6 +59,7 @@ class ThumbnailApiClient:
             state = data.get("state", {})
             return bool(state.get("job_count", 0) > 0)
         except Exception:
+            log.debug("Failed to check generation state", exc_info=True)
             return False
 
     def list_checkpoints(self, settings: AppSettings) -> list[str]:
@@ -179,6 +183,7 @@ class ThumbnailApiClient:
             except (OSError, ValueError):
                 exclude_resolved = Path(exclude_path).absolute()
         except Exception:
+            log.debug("Failed to resolve exclude path: %s", exclude_path, exc_info=True)
             exclude_resolved = Path(exclude_path)
         candidates: list[Path] = []
         for p in root.glob("*.txt"):
@@ -190,6 +195,7 @@ class ThumbnailApiClient:
                 if p_resolved != exclude_resolved:
                     candidates.append(p)
             except Exception:
+                log.debug("Failed to resolve path: %s", p, exc_info=True)
                 if str(p) != exclude_path:
                     candidates.append(p)
         if not candidates:

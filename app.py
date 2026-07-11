@@ -29,17 +29,21 @@ def _choose_ui_font_family() -> str:
 
 def main() -> int:
     app_dir = Path(__file__).resolve().parent
+    from wildcard_manager.logging_setup import setup_logging
+    setup_logging(app_dir)
+    import logging
+    log = logging.getLogger("wildcard_manager")
     app_id = "CompassLab.WildcardManager"
     try:
         windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
     except Exception:
-        pass
+        log.debug("Failed to set AppUserModelID", exc_info=True)
     try:
         hwnd = windll.kernel32.GetConsoleWindow()
         if hwnd:
             windll.user32.ShowWindow(hwnd, 0)
     except Exception:
-        pass
+        log.debug("Failed to hide console window", exc_info=True)
     app = QApplication(sys.argv)
     app.setApplicationName("Wildcard Manager")
     app.setDesktopFileName(app_id)

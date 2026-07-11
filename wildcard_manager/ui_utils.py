@@ -5,12 +5,15 @@ main_window.py と new_wildcard_dialog.py の両方で複製されていた
 """
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject
 from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import QLineEdit, QMenu, QPlainTextEdit, QTextEdit, QWidget
+
+log = logging.getLogger(__name__)
 
 
 def _delete_selected_text(widget) -> None:
@@ -81,6 +84,7 @@ def open_in_file_manager(path: Path | str, *, select: bool = False) -> bool:
                 return False
             return True
         except Exception:
+            log.debug("Failed to open file manager (Windows)", exc_info=True)
             return False
     elif sys.platform == "darwin":
         import subprocess
@@ -99,6 +103,7 @@ def open_in_file_manager(path: Path | str, *, select: bool = False) -> bool:
             )
             return True
         except Exception:
+            log.debug("Failed to open file manager (macOS)", exc_info=True)
             return False
     else:
         import subprocess
@@ -113,6 +118,7 @@ def open_in_file_manager(path: Path | str, *, select: bool = False) -> bool:
             )
             return True
         except Exception:
+            log.debug("Failed to open file manager (Linux)", exc_info=True)
             return False
 
 
@@ -130,5 +136,6 @@ def is_path_within(child: Path, parent: Path) -> bool:
             child_res = child.absolute()
             parent_res = parent.absolute()
         except Exception:
+            log.debug("Failed to resolve paths for is_path_within", exc_info=True)
             return False
     return child_res == parent_res or parent_res in child_res.parents

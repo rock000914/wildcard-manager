@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import shutil
 import os
@@ -8,6 +9,8 @@ import sqlite3
 from pathlib import Path
 import time
 from datetime import datetime
+
+log = logging.getLogger(__name__)
 
 from .models import AppSettings, WildcardEntry
 
@@ -36,6 +39,7 @@ def _safe_resolve(path: Path) -> str:
         try:
             return str(path.absolute())
         except Exception:
+            log.debug("Failed to resolve path: %s", path, exc_info=True)
             return str(path)
 
 
@@ -50,6 +54,7 @@ def _safe_resolve_path(path: Path) -> Path:
         try:
             return path.absolute()
         except Exception:
+            log.debug("Failed to resolve path: %s", path, exc_info=True)
             return path
 
 
@@ -86,12 +91,16 @@ def parse_prompt_tags(text: str) -> list[str]:
 
     以前は ``reversed`` して ``insert(0, ...)`` する二重逆転ロジックだったが、
     素直にリスト結合に書き直した（M4 修正）。結果は同一。
+
+    M15 修正: 以前は extract_lora_names でLoRA名だけ取り出し f"<lora:{name}:1>" と
+    強度を :1 に決め打ちしていたため、:0.6 など任意の強度で保存しても
+    読み込み時に常に :1 に戻るバグがあった。
+    LORA_PATTERN の group(0) でタグ全体をそのまま保持するよう修正。
     """
     seen: set[str] = set()
-    lora_tags = extract_lora_names(text)
     lora_formatted: list[str] = []
-    for lora in lora_tags:
-        tag = f"<lora:{lora}:1>"
+    for match in LORA_PATTERN.finditer(text):
+        tag = match.group(0)  # <lora:name:weight> をそのまま使う
         if tag not in seen:
             seen.add(tag)
             lora_formatted.append(tag)
@@ -167,7 +176,7 @@ class WildcardRepository:
             connection.execute("PRAGMA temp_store = MEMORY")
             connection.execute("PRAGMA cache_size = -2000")
         except Exception:
-            pass
+            log.debug("Failed to set PRAGMA settings", exc_info=True)
         return connection
 
     def _append_profile(self, message: str) -> None:
@@ -180,11 +189,11 @@ class WildcardRepository:
                     keep = keep[-self.PROFILE_LOG_MAX_BYTES // 2:]
                     log_path.write_text(keep, encoding="utf-8")
             except Exception:
-                pass
+                log.debug("Failed to truncate profile log", exc_info=True)
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"{datetime.now().isoformat()} {message}\n")
         except Exception:
-            pass
+            log.debug("Failed to write profile log", exc_info=True)
 
     def _init_db(self) -> None:
         with self._connect() as con:
@@ -193,7 +202,7 @@ class WildcardRepository:
             try:
                 con.execute("PRAGMA journal_mode=WAL")
             except Exception:
-                pass
+                log.debug("Failed to set WAL journal_mode", exc_info=True)
             con.execute(
                 """
                 CREATE TABLE IF NOT EXISTS entries (
@@ -254,7 +263,7 @@ class WildcardRepository:
                 for fname in fnames:
                     index.add(os.path.normcase(os.path.join(dirpath, fname)))
         except Exception:
-            pass
+            log.debug("Failed to walk thumbnail directory", exc_info=True)
         return index
 
     def resolve_thumbnail_path_fast(self, thumbnail_root: Path, rel_path: Path, thumb_index: set[str]) -> Path | None:
@@ -342,14 +351,17 @@ class WildcardRepository:
                     try:
                         file_mtime = txt_path.stat().st_mtime
                     except Exception:
+                        log.debug("Failed to stat txt file: %s", txt_path, exc_info=True)
                         file_mtime = 0.0
                     try:
                         sidecar_mtime = sidecar_path.stat().st_mtime if sidecar_path.exists() else 0.0
                     except Exception:
+                        log.debug("Failed to stat sidecar: %s", sidecar_path, exc_info=True)
                         sidecar_mtime = 0.0
                     try:
                         thumb_mtime = thumb_path.stat().st_mtime if thumb_path else 0.0
                     except Exception:
+                        log.debug("Failed to stat thumbnail: %s", thumb_path, exc_info=True)
                         thumb_mtime = 0.0
 
                     unchanged = (
@@ -399,7 +411,7 @@ class WildcardRepository:
         try:
             self._append_profile(f"load_entries: count={len(entries)} elapsed={elapsed:.3f}s")
         except Exception:
-            pass
+            log.debug("Failed to append profile", exc_info=True)
         return entries
 
     def load_entries_summary(self, settings: AppSettings | None = None) -> list[WildcardEntry]:
@@ -421,7 +433,7 @@ class WildcardRepository:
         try:
             self._append_profile(f"load_entries_summary: count={len(entries)} elapsed={elapsed:.3f}s")
         except Exception:
-            pass
+            log.debug("Failed to append profile", exc_info=True)
         return entries
 
     def load_entry_content(self, path: Path) -> str:
@@ -894,6 +906,7 @@ class WildcardRepository:
             tags = data.get("custom_tags", [])
             return sorted({str(tag).strip() for tag in tags if str(tag).strip()})
         except Exception:
+            log.debug("Failed to load custom tags from %s", path, exc_info=True)
             return []
 
     def db_entry_count(self) -> int:
