@@ -99,7 +99,7 @@ python app.py
 
 ## 更新履歴
 
-### 未リリース（ローカル開発中・GitHub 未反映）
+### v2.4 (2026-10-14) - お気に入り・ベースモデルバッジ・フォルダツリー操作
 
 #### 機能追加
 - **お気に入り機能**: サムネイル上の星マークでお気に入り登録／解除。フォルダツリーにお気に入り項目を表示し、その下への移動は禁止。`favorites.json` + DB `is_favorite` カラム + サイドカー JSON（`.wcm.json` 側）へ永続化
@@ -122,12 +122,12 @@ python app.py
 - **右クリックメニューの「フォルダを開く」を削除**（「エクスプローラーで開く」に一本化）
 
 #### アーキテクチャ改善
-- **`main_window.py` を 5,010行 → 3,634行に分割**:
-  - `workers.py`（443行）: ワーカークラス7個を抽出
-  - `widgets.py`（243行）: ウィジェットクラス5個を抽出
-  - `settings_dialog.py`（743行）: SettingsDialog を抽出
+- **`main_window.py` を 4,428行 → 3,216行に分割**（9db2a25 時点の実測）:
+  - `workers.py`（384行）: ワーカークラスを抽出
+  - `widgets.py`（205行）: ウィジェットクラスを抽出
+  - `settings_dialog.py`（691行）: SettingsDialog を抽出
 - **ロギング導入**: `logging_setup.py`（RotatingFileHandler）を新設
-- **`except Exception: pass` 18箇所を `log.debug()` に置換**
+- **`except Exception: pass` を握らず `log.debug()` で記録する形に変更**（当該コミット全体で `pass` 12箇所を除去、`log.debug()` 追加28箇所）
 - **`requirements.txt` でパッケージバージョン範囲を固定**
 
 #### ドキュメント
