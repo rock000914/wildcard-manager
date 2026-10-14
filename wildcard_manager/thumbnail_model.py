@@ -14,6 +14,41 @@ from .thumbnail_workers import ThumbnailLoadSignals, ThumbnailLoadTask
 CARD_FRAME_PADDING = 14
 CARD_ICON_RATIO = 1.5
 
+# LoRA BaseModel → サムネイル左上バッジの表示名と背景色。
+# new_wildcard_dialog.LoraCardWidget._BASE_MODEL_COLORS と同系色を使う。
+BASE_MODEL_BADGE_LABELS: dict[str, str] = {
+    "illustrious": "ill",
+    "anima": "ani",
+}
+BASE_MODEL_BADGE_COLORS: dict[str, str] = {
+    "illustrious": "#2f6fed",
+    "anima": "#c243c2",
+    "mix": "#e11d48",
+}
+
+
+def entry_base_badge(lora_names: list[str] | tuple[str, ...] | None,
+                     base_map: dict[str, str] | None) -> tuple[str, str] | None:
+    """ill/aniバッジの (表示テキスト, 背景色) を返す。不要なら None。
+
+    base_map は {lora名.lower(): BaseModel}。cm-info.json 由来。
+    ill系とani系の両方を含む場合は ("mix", 赤系) を返す。
+    """
+    if not lora_names or not base_map:
+        return None
+    kinds: set[str] = set()
+    for name in lora_names:
+        bm = (base_map.get(str(name).strip().lower()) or "").strip().lower()
+        if bm in BASE_MODEL_BADGE_LABELS:
+            kinds.add(bm)
+    if kinds == {"illustrious"}:
+        return (BASE_MODEL_BADGE_LABELS["illustrious"], BASE_MODEL_BADGE_COLORS["illustrious"])
+    if kinds == {"anima"}:
+        return (BASE_MODEL_BADGE_LABELS["anima"], BASE_MODEL_BADGE_COLORS["anima"])
+    if kinds == {"illustrious", "anima"}:
+        return ("mix", BASE_MODEL_BADGE_COLORS["mix"])
+    return None
+
 
 def _make_rounded_pixmap(pixmap: QPixmap, radius: int) -> QPixmap:
     """角丸クリッピングを適用した新しい QPixmap を返す。
@@ -100,6 +135,11 @@ class ThumbnailListModel(QAbstractListModel):
         super().__init__(parent)
         self.entries: list[WildcardEntry] = []
         self.thumbnail_size = 260
+        # お気に入りパスのセット（MainWindow から設定される）
+        self.favorite_paths: set[str] = set()
+        # LoRA名(lower) → BaseModel のマップ（MainWindow から設定される）。
+        # サムネイル左上の ill/ani バッジ描画に使う。
+        self.lora_base_model_map: dict[str, str] = {}
         # icon_cache には「読み込みに成功したサムネイル」だけを保持する。
         # 失敗結果はここに入れない（失敗の永久キャッシュを防ぐ）。
         # 【方針B】キーは (rel_path, thumbnail_size)。rel_path は環境非依存
@@ -532,4 +572,54 @@ class ThumbnailCardDelegate(QStyledItemDelegate):
             painter.setPen(QPen(QColor("white"), 4))
             painter.setBrush(Qt.NoBrush)
             painter.drawRoundedRect(rect, 12, 12)
+
+        model = index.model()
+        # サムネイル左上の ill/ani バッジ描画
+        try:
+            entry = model.entry_at(index)
+            base_map = getattr(model, "lora_base_model_map", None)
+            badge = entry_base_badge(entry.lora_names if entry is not None else None, base_map)
+        except Exception:
+            badge = None
+        if badge is not None:
+            badge_text, badge_color = badge
+            badge_font = QFont(painter.font())
+            badge_font.setBold(True)
+            badge_font.setPixelSize(max(10, min(13, rect.width() // 14)))
+            painter.setFont(badge_font)
+            badge_fm = QFontMetrics(badge_font)
+            badge_h = 18
+            badge_pad_x = 7
+            badge_w = badge_fm.horizontalAdvance(badge_text) + badge_pad_x * 2
+            badge_rect = QRect(rect.left() + 6, rect.top() + 6, badge_w, badge_h)
+            badge_bg = QColor(badge_color)
+            badge_bg.setAlpha(215)
+            painter.setPen(QPen(QColor("#10141a"), 1))
+            painter.setBrush(badge_bg)
+            painter.drawRoundedRect(badge_rect, 5, 5)
+            painter.setPen(QColor("white"))
+            painter.drawText(badge_rect, Qt.AlignCenter, badge_text)
+        # お気に入り星マークの描画
+        abs_path = index.data(Qt.UserRole)
+        favorite_paths: set[str] | None = getattr(model, "favorite_paths", None)
+        if favorite_paths is not None and abs_path in favorite_paths:
+            star_size = max(14, rect.width() // 8)
+            star_x = rect.right() - star_size - 6
+            star_y = rect.top() + 6
+            star_rect = QRect(star_x, star_y, star_size, star_size)
+            # 影（可読性向上）
+            painter.setPen(QPen(QColor("#00000088"), 1))
+            painter.setBrush(QColor("#00000044"))
+            painter.drawEllipse(star_rect.adjusted(1, 1, 1, 1))
+            # 星の円形バッジ
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("#1a1a2e"))
+            painter.drawEllipse(star_rect)
+            # 星テキスト
+            star_font = painter.font()
+            star_font.setPixelSize(max(10, star_size - 3))
+            painter.setFont(star_font)
+            painter.setPen(QColor("#FFD700"))
+            painter.drawText(star_rect, Qt.AlignCenter, "★")
+
         painter.restore()

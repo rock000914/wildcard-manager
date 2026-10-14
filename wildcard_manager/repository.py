@@ -228,6 +228,8 @@ class WildcardRepository:
             columns = {row[1] for row in con.execute("PRAGMA table_info(entries)")}
             if "search_text" not in columns:
                 con.execute("ALTER TABLE entries ADD COLUMN search_text TEXT NOT NULL DEFAULT ''")
+            if "is_favorite" not in columns:
+                con.execute("ALTER TABLE entries ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0")
             con.execute("CREATE INDEX IF NOT EXISTS idx_entries_rel_path ON entries(rel_path)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_entries_folder ON entries(folder)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_entries_name ON entries(name)")
@@ -420,7 +422,7 @@ class WildcardRepository:
             rows = con.execute(
                 """
                 SELECT abs_path, rel_path, folder, name, stem, first_line, line_count,
-                       custom_tags_json, lora_names_json, thumbnail_path, has_thumbnail, search_text
+                       custom_tags_json, lora_names_json, thumbnail_path, has_thumbnail, is_favorite, search_text
                 FROM entries
                 WHERE rowid IN (
                     SELECT MAX(rowid) FROM entries GROUP BY rel_path
@@ -445,9 +447,45 @@ class WildcardRepository:
         txt_path.write_text(content, encoding="utf-8")
 
         sidecar_path = sidecar_metadata_path(txt_path)
-        sidecar_data = {"custom_tags": sorted({tag.strip() for tag in custom_tags if tag.strip()})}
+        sidecar_data = {}
+        if sidecar_path.exists():
+            try:
+                sidecar_data = json.loads(sidecar_path.read_text(encoding="utf-8"))
+                if not isinstance(sidecar_data, dict):
+                    sidecar_data = {}
+            except Exception:
+                sidecar_data = {}
+        sidecar_data["custom_tags"] = sorted({tag.strip() for tag in custom_tags if tag.strip()})
+        sidecar_data["is_favorite"] = entry.is_favorite
         sidecar_path.write_text(json.dumps(sidecar_data, ensure_ascii=False, indent=2), encoding="utf-8")
         return self.refresh_entry(settings, txt_path)
+
+    def set_favorite(self, settings: AppSettings, entry: WildcardEntry, is_favorite: bool) -> None:
+        entry.is_favorite = is_favorite
+        txt_path = Path(entry.abs_path)
+        sidecar_path = sidecar_metadata_path(txt_path)
+        sidecar_data = {}
+        if sidecar_path.exists():
+            try:
+                sidecar_data = json.loads(sidecar_path.read_text(encoding="utf-8"))
+                if not isinstance(sidecar_data, dict):
+                    sidecar_data = {}
+            except Exception:
+                sidecar_data = {}
+        sidecar_data["is_favorite"] = is_favorite
+        try:
+            sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+            sidecar_path.write_text(json.dumps(sidecar_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            log.debug("Failed to write sidecar for favorite: %s", sidecar_path, exc_info=True)
+
+        sidecar_mtime = sidecar_path.stat().st_mtime if sidecar_path.exists() else 0.0
+        file_mtime = txt_path.stat().st_mtime if txt_path.exists() else 0.0
+        thumb_path = self.resolve_thumbnail_path(settings, txt_path)
+        thumb_mtime = thumb_path.stat().st_mtime if thumb_path else 0.0
+
+        with self._connect() as con:
+            self._upsert(con, entry, file_mtime, sidecar_mtime, thumb_mtime)
 
     def refresh_entry(self, settings: AppSettings, txt_path: Path) -> WildcardEntry:
         file_mtime = txt_path.stat().st_mtime
@@ -541,6 +579,128 @@ class WildcardRepository:
             shutil.rmtree(target_thumbnails)
 
         return {"wildcards": wildcard_count, "thumbnails": thumbnail_count}
+
+    @staticmethod
+    def _validate_folder_name(name: str) -> str:
+        cleaned = name.strip().replace("\\", "/").strip("/")
+        if not cleaned or "/" in cleaned or cleaned in (".", ".."):
+            raise ValueError("フォルダ名が不正です。")
+        if any(c in cleaned for c in '<>:"|?*'):
+            raise ValueError("フォルダ名に使用できない文字が含まれています。")
+        return cleaned
+
+    def _resolve_library_subpath(self, settings: AppSettings, key: str) -> Path:
+        root = _safe_resolve_path(Path(settings.library_root))
+        key = key.strip().replace("\\", "/").strip("/")
+        if not key:
+            return root
+        parts = [p for p in key.split("/") if p not in ("", ".")]
+        target = _safe_resolve_path(root / Path(*parts)) if parts else root
+        if target != root and root not in target.parents:
+            raise ValueError("ライブラリ外のパスです。")
+        return target
+
+    def create_folder(self, settings: AppSettings, parent_key: str, name: str) -> str:
+        clean_name = self._validate_folder_name(name)
+        parent = self._resolve_library_subpath(settings, parent_key)
+        new_dir = _safe_resolve_path(parent / clean_name)
+        if new_dir.exists():
+            raise FileExistsError(f"同名のフォルダが既に存在します: {clean_name}")
+        new_dir.mkdir(parents=True)
+        parent_key = parent_key.strip().replace("\\", "/").strip("/")
+        return f"{parent_key}/{clean_name}" if parent_key else clean_name
+
+    def rename_folder(self, settings: AppSettings, folder_key: str, new_name: str) -> str:
+        folder_key = folder_key.strip().replace("\\", "/").strip("/")
+        if not folder_key:
+            raise ValueError("ルートフォルダは名前を変更できません。")
+        clean_name = self._validate_folder_name(new_name)
+        parent_key = "/".join(folder_key.split("/")[:-1])
+        new_key = f"{parent_key}/{clean_name}" if parent_key else clean_name
+        if new_key == folder_key:
+            return new_key
+        old_dir = self._resolve_library_subpath(settings, folder_key)
+        new_dir = self._resolve_library_subpath(settings, new_key)
+        if not old_dir.exists():
+            raise FileNotFoundError(f"フォルダが見つかりません: {folder_key}")
+        if new_dir.exists():
+            raise FileExistsError(f"同名のフォルダが既に存在します: {clean_name}")
+        old_dir.rename(new_dir)
+        thumb_root = _safe_resolve_path(Path(settings.thumbnail_root))
+        old_thumb = _safe_resolve_path(thumb_root / Path(*folder_key.split("/")))
+        new_thumb = _safe_resolve_path(thumb_root / Path(*new_key.split("/")))
+        if old_thumb.exists() and thumb_root in old_thumb.parents and not new_thumb.exists():
+            new_thumb.parent.mkdir(parents=True, exist_ok=True)
+            old_thumb.rename(new_thumb)
+        with self._connect() as con:
+            self._rewrite_folder_entries(con, settings, folder_key, new_key)
+        return new_key
+
+    def move_folder(self, settings: AppSettings, src_key: str, dest_parent_key: str) -> str:
+        src_key = src_key.strip().replace("\\", "/").strip("/")
+        dest_parent_key = dest_parent_key.strip().replace("\\", "/").strip("/")
+        if not src_key:
+            raise ValueError("ルートフォルダは移動できません。")
+        name = src_key.split("/")[-1]
+        new_key = f"{dest_parent_key}/{name}" if dest_parent_key else name
+        if new_key == src_key:
+            return new_key
+        if dest_parent_key == src_key or dest_parent_key.startswith(src_key + "/"):
+            raise ValueError("自分自身または子フォルダへは移動できません。")
+        src_dir = self._resolve_library_subpath(settings, src_key)
+        dest_parent_dir = self._resolve_library_subpath(settings, dest_parent_key)
+        if not src_dir.exists():
+            raise FileNotFoundError(f"フォルダが見つかりません: {src_key}")
+        new_dir = _safe_resolve_path(dest_parent_dir / name)
+        if new_dir.exists():
+            raise FileExistsError(f"移動先に同名のフォルダが存在します: {name}")
+        dest_parent_dir.mkdir(parents=True, exist_ok=True)
+        src_dir.rename(new_dir)
+        thumb_root = _safe_resolve_path(Path(settings.thumbnail_root))
+        src_thumb = _safe_resolve_path(thumb_root / Path(*src_key.split("/")))
+        if src_thumb.exists() and thumb_root in src_thumb.parents:
+            new_thumb = _safe_resolve_path(thumb_root / Path(*new_key.split("/")))
+            if not new_thumb.exists():
+                new_thumb.parent.mkdir(parents=True, exist_ok=True)
+                src_thumb.rename(new_thumb)
+        with self._connect() as con:
+            self._rewrite_folder_entries(con, settings, src_key, new_key)
+        return new_key
+
+    def _rewrite_folder_entries(self, con: sqlite3.Connection, settings: AppSettings, old_key: str, new_key: str) -> None:
+        """フォルダの rename/move 後に DB 内のパス列を書き換える。"""
+        library_root = _safe_resolve_path(Path(settings.library_root))
+        thumbnail_root = _safe_resolve_path(Path(settings.thumbnail_root))
+
+        def _abs(root: Path, key: str) -> str:
+            if not key:
+                return str(root)
+            return str(_safe_resolve_path(root / Path(*key.split("/"))))
+
+        old_abs = _abs(library_root, old_key)
+        new_abs = _abs(library_root, new_key)
+        new_thumb_root_abs = _abs(thumbnail_root, new_key)
+        old_rel_prefix = old_key + "/" if old_key else ""
+
+        rows = con.execute("SELECT abs_path, rel_path, thumbnail_path, search_text FROM entries").fetchall()
+        for row in rows:
+            rel_path = row["rel_path"]
+            if rel_path != old_key and not (old_rel_prefix and rel_path.startswith(old_rel_prefix)):
+                continue
+            rest = rel_path[len(old_rel_prefix):] if old_rel_prefix else rel_path
+            new_rel = f"{new_key}/{rest}" if new_key else rest
+            new_abs_path = str(_safe_resolve_path(Path(new_abs) / Path(*rest.split("/"))))
+            posix_parent = Path(new_rel).parent.as_posix()
+            new_folder = "" if posix_parent == "." else posix_parent
+            thumb = row["thumbnail_path"]
+            new_thumb = None
+            if thumb:
+                new_thumb = str(_safe_resolve_path(Path(new_thumb_root_abs) / Path(thumb).name))
+            new_search = str(row["search_text"] or "").replace(rel_path.lower(), new_rel.lower(), 1)
+            con.execute(
+                "UPDATE entries SET abs_path=?, rel_path=?, folder=?, thumbnail_path=?, search_text=? WHERE abs_path=?",
+                (new_abs_path, new_rel, new_folder, new_thumb, new_search, row["abs_path"]),
+            )
 
     def import_from_sources(self, settings: AppSettings, mode: str = "copy", conflict_policy: str = "overwrite", progress=None) -> dict[str, int]:
         source_root = Path(settings.source_wildcard_root)
@@ -718,7 +878,7 @@ class WildcardRepository:
         rel_path = txt_path.relative_to(Path(settings.library_root)).as_posix()
         folder = Path(rel_path).parent.as_posix()
         folder = "" if folder == "." else folder
-        custom_tags = self._load_custom_tags(sidecar_metadata_path(txt_path))
+        custom_tags, is_favorite = self._load_sidecar_metadata(sidecar_metadata_path(txt_path))
         lora_names = extract_lora_names(content)
         thumb_path = resolved_thumb if resolved_thumb is not None else self.resolve_thumbnail_path(settings, txt_path)
         lines = [line for line in content.splitlines() if line.strip()]
@@ -739,6 +899,7 @@ class WildcardRepository:
             lora_names=lora_names,
             thumbnail_path=_safe_resolve(thumb_path) if thumb_path else None,
             has_thumbnail=bool(thumb_path),
+            is_favorite=is_favorite,
             search_text=" ".join(
                 [
                     rel_path.lower(),
@@ -762,9 +923,9 @@ class WildcardRepository:
                 """
                 INSERT INTO entries (
                     abs_path, rel_path, folder, name, stem, content, search_text, first_line, line_count,
-                    custom_tags_json, lora_names_json, thumbnail_path, has_thumbnail,
+                    custom_tags_json, lora_names_json, thumbnail_path, has_thumbnail, is_favorite,
                     file_mtime, sidecar_mtime, thumb_mtime
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(abs_path) DO UPDATE SET
                     rel_path=excluded.rel_path,
                     folder=excluded.folder,
@@ -778,6 +939,7 @@ class WildcardRepository:
                     lora_names_json=excluded.lora_names_json,
                     thumbnail_path=excluded.thumbnail_path,
                     has_thumbnail=excluded.has_thumbnail,
+                    is_favorite=excluded.is_favorite,
                     file_mtime=excluded.file_mtime,
                     sidecar_mtime=excluded.sidecar_mtime,
                     thumb_mtime=excluded.thumb_mtime
@@ -796,6 +958,7 @@ class WildcardRepository:
                     json.dumps(entry.lora_names, ensure_ascii=False),
                     entry.thumbnail_path,
                     1 if entry.has_thumbnail else 0,
+                    1 if entry.is_favorite else 0,
                     file_mtime,
                     sidecar_mtime,
                     thumb_mtime,
@@ -809,9 +972,9 @@ class WildcardRepository:
                 """
                 INSERT INTO entries (
                     abs_path, rel_path, folder, name, stem, content, search_text, first_line, line_count,
-                    custom_tags_json, lora_names_json, thumbnail_path, has_thumbnail,
+                    custom_tags_json, lora_names_json, thumbnail_path, has_thumbnail, is_favorite,
                     file_mtime, sidecar_mtime, thumb_mtime
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     entry.abs_path,
@@ -827,6 +990,7 @@ class WildcardRepository:
                     json.dumps(entry.lora_names, ensure_ascii=False),
                     entry.thumbnail_path,
                     1 if entry.has_thumbnail else 0,
+                    1 if entry.is_favorite else 0,
                     file_mtime,
                     sidecar_mtime,
                     thumb_mtime,
@@ -853,6 +1017,8 @@ class WildcardRepository:
         if settings is not None:
             abs_path = self._portable_abs_path(settings, row["rel_path"], abs_path)
             thumbnail_path = self._portable_thumbnail_path(settings, row["rel_path"], thumbnail_path)
+        keys = row.keys()
+        is_fav = bool(row["is_favorite"]) if "is_favorite" in keys else False
         return WildcardEntry(
             rel_path=row["rel_path"],
             abs_path=abs_path,
@@ -866,6 +1032,7 @@ class WildcardRepository:
             lora_names=json.loads(row["lora_names_json"] or "[]"),
             thumbnail_path=thumbnail_path,
             has_thumbnail=bool(thumbnail_path),
+            is_favorite=is_fav,
             search_text=row["search_text"] or "",
         )
 
@@ -875,6 +1042,8 @@ class WildcardRepository:
         if settings is not None:
             abs_path = self._portable_abs_path(settings, row["rel_path"], abs_path)
             thumbnail_path = self._portable_thumbnail_path(settings, row["rel_path"], thumbnail_path)
+        keys = row.keys()
+        is_fav = bool(row["is_favorite"]) if "is_favorite" in keys else False
         return WildcardEntry(
             rel_path=row["rel_path"],
             abs_path=abs_path,
@@ -887,6 +1056,7 @@ class WildcardRepository:
             lora_names=json.loads(row["lora_names_json"] or "[]"),
             thumbnail_path=thumbnail_path,
             has_thumbnail=bool(thumbnail_path),
+            is_favorite=is_fav,
             search_text=row["search_text"] or "",
         )
 
@@ -898,16 +1068,24 @@ class WildcardRepository:
                 continue
         return path.read_text(encoding="utf-8", errors="replace")
 
-    def _load_custom_tags(self, path: Path) -> list[str]:
+    def _load_sidecar_metadata(self, path: Path) -> tuple[list[str], bool]:
         if not path.exists():
-            return []
+            return [], False
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return [], False
             tags = data.get("custom_tags", [])
-            return sorted({str(tag).strip() for tag in tags if str(tag).strip()})
+            custom_tags = sorted({str(tag).strip() for tag in tags if str(tag).strip()})
+            is_favorite = bool(data.get("is_favorite", False))
+            return custom_tags, is_favorite
         except Exception:
-            log.debug("Failed to load custom tags from %s", path, exc_info=True)
-            return []
+            log.debug("Failed to load sidecar metadata from %s", path, exc_info=True)
+            return [], False
+
+    def _load_custom_tags(self, path: Path) -> list[str]:
+        tags, _ = self._load_sidecar_metadata(path)
+        return tags
 
     def db_entry_count(self) -> int:
         with self._connect() as con:

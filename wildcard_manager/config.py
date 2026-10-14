@@ -80,6 +80,7 @@ class UIStateStore:
             "sort_key": settings.sort_key,
             "sort_order": settings.sort_order,
             "thumbnail_size": settings.thumbnail_size,
+            "lora_sort_mode": settings.lora_sort_mode,
         }
         with self.path.open("w", encoding="utf-8") as handle:
             json.dump(data, handle, ensure_ascii=False, indent=2)

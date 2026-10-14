@@ -55,6 +55,7 @@ class AppSettings:
     sort_key: str = "name"
     sort_order: str = "asc"
     lora_root: str = ""
+    lora_sort_mode: str = "added_desc"
     scroll_step: int = 30
     # 新規ワイルドカードダイアログで追加されたカスタムタブ（キャラクタータブ以外）の設定。
     # [{"name": "タブ名", "save_path": "/path/to/folder"}, ...]
@@ -97,6 +98,7 @@ class WildcardEntry:
     lora_names: list[str] = field(default_factory=list)
     thumbnail_path: str | None = None
     has_thumbnail: bool = False
+    is_favorite: bool = False
     search_text: str = ""
 
     @property

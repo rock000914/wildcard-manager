@@ -5,7 +5,9 @@ import copy
 import io
 import json
 import logging
+import os
 import re
+import struct
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
@@ -152,6 +154,33 @@ def natural_sort_key(text: str) -> tuple[object, ...]:
         else:
             key.append((1, part))
     return tuple(key)
+
+
+class FolderTreeWidget(QTreeWidget):
+    """フォルダツリー。ドラッグ&ドロップによるフォルダ移動要求を送出する。"""
+
+    folder_move_requested = Signal(str, str)  # (src_key, dest_parent_key)
+
+    def dropEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        source = self.currentItem()
+        pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        target = self.itemAt(pos)
+        if source is None or target is None or source is target:
+            event.ignore()
+            return
+        src_key = str(source.data(0, Qt.UserRole) or "")
+        dest_key = str(target.data(0, Qt.UserRole) or "")
+        if not src_key or src_key == "__favorites__" or src_key.startswith("__favorites__/"):
+            event.ignore()
+            return
+        if dest_key == "__favorites__" or dest_key.startswith("__favorites__/"):
+            event.ignore()
+            return
+        if dest_key == src_key or dest_key.startswith(src_key + "/"):
+            event.ignore()
+            return
+        self.folder_move_requested.emit(src_key, dest_key)
+        event.acceptProposedAction()
 
 
 class RandomGenerationDialog(QDialog):
@@ -880,7 +909,14 @@ class MainWindow(QMainWindow):
         self._content_load_cache_max = 500
         self._suppress_splitter_tracking = False
         self.folder_children_map: dict[str, set[str]] = {}
+        self.fav_folder_children_map: dict[str, set[str]] = {}
         self._folder_tree_populating = False
+        # お気に入り機能: お気に入りエントリの abs_path を保持するセット
+        self.favorites_file = app_dir / "favorites.json"
+        self.favorite_paths: set[str] = self._load_favorites()
+        # LoRA名(lower) → BaseModel のマップ（cm-info.json由来）。
+        # ill/aniバッジ描画とモデルフィルタの判定に使う。
+        self._lora_base_model_map: dict[str, str] = {}
         self._startup_load_requested = False
         # rescan_library の完了コールバックで参照されるため、
         # 初期化前に _on_rescan_finished が発火しても AttributeError に
@@ -914,6 +950,8 @@ class MainWindow(QMainWindow):
 
         self.list_model = ThumbnailListModel(self)
         self.list_model.set_thumbnail_size(self.settings.thumbnail_size)
+        self.list_model.favorite_paths = self.favorite_paths  # お気に入り参照を共有
+        self.list_model.lora_base_model_map = self._lora_base_model_map  # ill/aniバッジ参照を共有
         self.item_delegate = ThumbnailCardDelegate(self)
 
         self.setWindowTitle("Wildcard Manager")
@@ -1178,12 +1216,16 @@ class MainWindow(QMainWindow):
         self.splitter.setChildrenCollapsible(True)
         root_layout.addWidget(self.splitter, 1)
 
-        self.folder_tree = QTreeWidget()
+        self.folder_tree = FolderTreeWidget()
         self.folder_tree.setHeaderLabel("フォルダ")
         self.folder_tree.itemSelectionChanged.connect(self._on_folder_changed)
         self.folder_tree.itemExpanded.connect(self._on_folder_item_expanded)
         self.folder_tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.folder_tree.customContextMenuRequested.connect(self._show_folder_context_menu)
+        self.folder_tree.folder_move_requested.connect(self._on_folder_tree_move_requested)
+        self.folder_tree.setDragDropMode(QAbstractItemView.DragDrop)
+        self.folder_tree.setDefaultDropAction(Qt.IgnoreAction)
+        self.folder_tree.setDragEnabled(True)
         self.folder_tree.setMinimumWidth(0)
         self.folder_tree.setIndentation(12)
         self.folder_tree.setAnimated(False)
@@ -1199,7 +1241,8 @@ class MainWindow(QMainWindow):
 
         self.folder_tree_container = QWidget()
         folder_container_layout = QVBoxLayout(self.folder_tree_container)
-        folder_container_layout.setContentsMargins(0, 0, 0, 0)
+        # LoRAコンテナ(左右4px)と幅を揃える
+        folder_container_layout.setContentsMargins(4, 0, 4, 0)
         folder_container_layout.setSpacing(0)
         folder_container_layout.addWidget(self.folder_tree, 1)
 
@@ -1207,6 +1250,16 @@ class MainWindow(QMainWindow):
         lora_container_layout = QVBoxLayout(self.lora_container)
         lora_container_layout.setContentsMargins(4, 2, 4, 4)
         lora_container_layout.setSpacing(2)
+        # モデルフィルタ（LoRAフィルタの上に1行）。cm-info.jsonのBaseModelで絞り込む。
+        self.model_filter_combo = NoWheelComboBox()
+        self.model_filter_combo.setToolTip("LoRAのBaseModelで絞り込む")
+        self.model_filter_combo.addItem("モデル: すべて", "")
+        self.model_filter_combo.addItem("illのみ", "illustrious")
+        self.model_filter_combo.addItem("aniのみ", "anima")
+        self.model_filter_combo.addItem("混在", "mix")
+        self.model_filter_combo.addItem("LoRAなし", "nolora")
+        self.model_filter_combo.currentIndexChanged.connect(lambda _idx: self.schedule_apply_filters())
+        lora_container_layout.addWidget(self.model_filter_combo)
         lora_header_layout = QHBoxLayout()
         lora_header_layout.setContentsMargins(0, 0, 0, 0)
         lora_header_layout.addWidget(QLabel("LoRAフィルタ"))
@@ -1731,7 +1784,12 @@ class MainWindow(QMainWindow):
 
     def _set_result_count_label(self, count: int) -> None:
         self.result_count_label.setText(f"{count} 件")
-        folder_info = self.current_folder_prefix or "すべて"
+        if self.current_folder_prefix == "__favorites__":
+            folder_info = "お気に入り"
+        elif self.current_folder_prefix.startswith("__favorites__/"):
+            folder_info = "お気に入り/" + self.current_folder_prefix[len("__favorites__/"):]
+        else:
+            folder_info = self.current_folder_prefix or "すべて"
         thumb_count = sum(1 for e in self.filtered_entries if e.has_thumbnail)
         selected = len(self.card_view.selectionModel().selectedIndexes()) if self.card_view.selectionModel() else 0
         selected_unique = len(set(
@@ -2225,20 +2283,11 @@ class MainWindow(QMainWindow):
             self.entry_by_path = {entry.abs_path: entry for entry in self.entries}
             self.search_cache = {entry.abs_path: entry.search_text for entry in self.entries}
 
-            folder_children: dict[str, set[str]] = {}
-            for entry in self.entries:
-                if not entry.folder:
-                    continue
-                chain = ""
-                for part in entry.folder.split("/"):
-                    parent_key = chain
-                    chain = part if not chain else f"{chain}/{part}"
-                    folder_children.setdefault(parent_key, set()).add(part)
-
-            self.folder_children_map = folder_children
+            self._rebuild_folder_maps()
             self._rebuild_folder_tree()
             current_item = self.folder_tree.currentItem()
             self.current_folder_prefix = current_item.data(0, Qt.UserRole) if current_item else ""
+            self._refresh_lora_base_model_map()
             self.apply_filters()
             # 【F5修正】再スキャン後に全サムネイルキャッシュをクリアして
             # 強制再描画。サムネイルファイルが同じパスに上書き保存された場合、
@@ -2378,21 +2427,111 @@ class MainWindow(QMainWindow):
         self.entry_by_path = {entry.abs_path: entry for entry in self.entries}
         self.search_cache = {entry.abs_path: entry.search_text for entry in self.entries}
 
+    def _find_all_item(self) -> QTreeWidgetItem | None:
+        for i in range(self.folder_tree.topLevelItemCount()):
+            item = self.folder_tree.topLevelItem(i)
+            if item and item.data(0, Qt.UserRole) == "":
+                return item
+        return None
+
+    def _find_favorites_item(self) -> QTreeWidgetItem | None:
+        for i in range(self.folder_tree.topLevelItemCount()):
+            item = self.folder_tree.topLevelItem(i)
+            if item and item.data(0, Qt.UserRole) == "__favorites__":
+                return item
+        return None
+
+    def _rebuild_folder_maps(self) -> None:
+        """エントリ由来のフォルダツリー + ディスク上の空フォルダ + お気に入り階層を再構築する。"""
+        folder_children: dict[str, set[str]] = {}
+        for entry in self.entries:
+            if not entry.folder:
+                continue
+            chain = ""
+            for part in entry.folder.split("/"):
+                parent_key = chain
+                chain = part if not chain else f"{chain}/{part}"
+                folder_children.setdefault(parent_key, set()).add(part)
+        # 空フォルダ（wildcard が1件も無いディレクトリ）もツリーに表示するため、
+        # ディスク上の実ディレクトリを走査してマージする。
+        root = Path(self.settings.library_root) if self.settings.library_root else None
+        if root is not None and root.exists():
+            try:
+                for disk_dir in root.rglob("*"):
+                    if not disk_dir.is_dir():
+                        continue
+                    try:
+                        rel = disk_dir.relative_to(root).as_posix()
+                    except ValueError:
+                        continue
+                    chain = ""
+                    for part in rel.split("/"):
+                        parent_key = chain
+                        chain = part if not chain else f"{chain}/{part}"
+                        folder_children.setdefault(parent_key, set()).add(part)
+            except OSError:
+                log.debug("Failed to scan disk folders for tree", exc_info=True)
+        self.folder_children_map = folder_children
+        self._rebuild_fav_children_map()
+
+    def _rebuild_fav_children_map(self) -> None:
+        """お気に入り登録済みエントリの元フォルダ階層をマップ化する。"""
+        fav_children: dict[str, set[str]] = {}
+        for entry in self.entries:
+            if entry.abs_path not in self.favorite_paths or not entry.folder:
+                continue
+            chain = ""
+            for part in entry.folder.split("/"):
+                parent_key = chain
+                chain = part if not chain else f"{chain}/{part}"
+                fav_children.setdefault(parent_key, set()).add(part)
+        self.fav_folder_children_map = fav_children
+
+    def _refresh_favorites_tree(self) -> None:
+        """お気に入りのトグル後に ★ お気に入り 配下の子だけを再構築する。"""
+        self._rebuild_fav_children_map()
+        fav_item = self._find_favorites_item()
+        if fav_item is None:
+            return
+        if self.fav_folder_children_map.get(""):
+            fav_item.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
+        if not self._is_folder_item_populated(fav_item):
+            return
+        self._folder_tree_populating = True
+        try:
+            fav_item.takeChildren()
+            fav_item.setData(0, Qt.UserRole + 1, False)
+            self._populate_folder_children(fav_item)
+        finally:
+            self._folder_tree_populating = False
+
     def _rebuild_folder_tree(self) -> None:
         self._folder_tree_populating = True
         try:
             self.folder_tree.clear()
             self.folder_tree.setUpdatesEnabled(False)
             self.folder_tree.blockSignals(True)
+
+            fav_item = QTreeWidgetItem(["★ お気に入り"])
+            fav_item.setData(0, Qt.UserRole, "__favorites__")
+            fav_icon_type = getattr(QStyle, "SP_FileDialogFavorite", QStyle.SP_DirHomeIcon)
+            fav_item.setIcon(0, self.style().standardIcon(fav_icon_type))
+            fav_item.setData(0, Qt.UserRole + 1, False)
+            if self.fav_folder_children_map.get(""):
+                fav_item.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
+            self.folder_tree.addTopLevelItem(fav_item)
+
             root = QTreeWidgetItem(["(all)"])
             root.setData(0, Qt.UserRole, "")
             root.setIcon(0, self.style().standardIcon(QStyle.SP_DirHomeIcon))
             root.setData(0, Qt.UserRole + 1, False)
             self.folder_tree.addTopLevelItem(root)
+
             self._populate_folder_children(root)
             self.folder_tree.expandItem(root)
             self._ensure_folder_path(self.current_folder_prefix, root)
-            self.folder_tree.setCurrentItem(self._find_folder_item(self.current_folder_prefix) or root)
+            target_item = self._find_folder_item(self.current_folder_prefix) or root
+            self.folder_tree.setCurrentItem(target_item)
         finally:
             self.folder_tree.blockSignals(False)
             self.folder_tree.setUpdatesEnabled(True)
@@ -2411,25 +2550,55 @@ class MainWindow(QMainWindow):
         if self._is_folder_item_populated(item):
             return
         folder_key = self._folder_item_key(item)
-        children = self.folder_children_map.get(folder_key, set())
-        for child_name in sorted(children, key=natural_sort_key):
-            child_key = child_name if not folder_key else f"{folder_key}/{child_name}"
+        if folder_key == "__favorites__" or folder_key.startswith("__favorites__/"):
+            # お気に入りツリー: 元フォルダ構造を ★ お気に入り 配下にミラーする
+            sub_key = folder_key[len("__favorites__/"):] if folder_key.startswith("__favorites__/") else ""
+            children_map = self.fav_folder_children_map
+            key_prefix = folder_key
+        else:
+            sub_key = folder_key
+            children_map = self.folder_children_map
+            key_prefix = folder_key
+        for child_name in sorted(children_map.get(sub_key, set()), key=natural_sort_key):
+            child_rel = child_name if not sub_key else f"{sub_key}/{child_name}"
+            child_key = f"{key_prefix}/{child_name}" if key_prefix else child_name
             child = QTreeWidgetItem([child_name])
             child.setData(0, Qt.UserRole, child_key)
             child.setData(0, Qt.UserRole + 1, False)
             child.setIcon(0, self.style().standardIcon(QStyle.SP_DirIcon))
-            if self.folder_children_map.get(child_key):
+            if children_map.get(child_rel):
                 child.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
             item.addChild(child)
         self._mark_folder_item_populated(item)
 
     def _find_folder_item(self, folder_key: str) -> QTreeWidgetItem | None:
+        if folder_key == "__favorites__" or folder_key.startswith("__favorites__/"):
+            fav_item = self._find_favorites_item()
+            if fav_item is None:
+                return None
+            if folder_key == "__favorites__":
+                return fav_item
+            parts = folder_key[len("__favorites__/"):].split("/")
+            item = fav_item
+            for part in parts:
+                self._populate_folder_children(item)
+                next_item = None
+                for i in range(item.childCount()):
+                    child = item.child(i)
+                    if child.text(0) == part:
+                        next_item = child
+                        break
+                if next_item is None:
+                    return None
+                item = next_item
+            return item
+        all_item = self._find_all_item()
         if not folder_key:
-            return self.folder_tree.topLevelItem(0)
-        parts = folder_key.split("/")
-        item = self.folder_tree.topLevelItem(0)
-        if item is None:
+            return all_item
+        if all_item is None:
             return None
+        parts = folder_key.split("/")
+        item = all_item
         for part in parts:
             self._populate_folder_children(item)
             next_item = None
@@ -2446,10 +2615,21 @@ class MainWindow(QMainWindow):
     def _ensure_folder_path(self, folder_key: str, root: QTreeWidgetItem | None = None) -> None:
         if not folder_key:
             return
-        item = root or self.folder_tree.topLevelItem(0)
-        if item is None:
-            return
-        for part in folder_key.split("/"):
+        if folder_key == "__favorites__" or folder_key.startswith("__favorites__/"):
+            fav_item = self._find_favorites_item()
+            if fav_item is None:
+                return
+            if folder_key == "__favorites__":
+                fav_item.setExpanded(True)
+                return
+            item = fav_item
+            parts = folder_key[len("__favorites__/"):].split("/")
+        else:
+            item = root or self._find_all_item()
+            if item is None:
+                return
+            parts = folder_key.split("/")
+        for part in parts:
             self._populate_folder_children(item)
             next_item = None
             for i in range(item.childCount()):
@@ -2471,6 +2651,124 @@ class MainWindow(QMainWindow):
         item = self.folder_tree.currentItem()
         self.current_folder_prefix = item.data(0, Qt.UserRole) if item else ""
         self.schedule_apply_filters()
+
+    @staticmethod
+    def _classify_safetensor_header(path: Path) -> str:
+        """safetensorsヘッダーのみで 'Anima' / 'Illustrious' / '' を返す。
+
+        cm-info.json が無い・BaseModel が Unknown の場合のフォールバック。
+        実測に基づく根拠:
+        - anima はヘッダーで確定できる (modelspec.architecture='anima*/lora',
+          ss_base_model_version='anima', テンソルキーが diffusion_model.blocks.*
+          または lora_unet_blocks_* でSDXL系の lora_te1_* と重ならない)。
+        - illustrious はヘッダー単体ではSDXL系までしか言えない
+          (architecture='stable-diffusion-xl-v1-base/lora',
+          ss_base_model_version='sdxl_*' はPony等と共通) ため、
+          学習時ベース名・LoRA名のトークンに 'illustrious' または
+          '_il' 系（'il', 'ilv5' 等）を含む場合のみ 'Illustrious' とする
+          （ファイル名依存のヒューリスティック）。
+        - 'anime' と 'anima' を取り違えないよう、名前の照合は
+          セパレータ区切りのトークン完全一致で行う。素朴な部分一致は禁止
+         （'pornmasterAnime_ilV5' を anima と誤判定する等の事故を防ぐ）。
+          'il' も単独トークンまたは il+バージョンのみ有効とし、
+          'detail' / 'file' / 'wild' 等の単語内 'il' には反応しない。
+        """
+        try:
+            with path.open("rb") as handle:
+                (size,) = struct.unpack("<Q", handle.read(8))
+                if size > 10 * 1024 * 1024:
+                    return ""
+                header = json.loads(handle.read(size))
+        except Exception:
+            return ""
+        try:
+            md = header.get("__metadata__", {}) or {}
+            arch = str(md.get("modelspec.architecture", "") or "").lower()
+            ver = str(md.get("ss_base_model_version", "") or "").lower()
+            sdm = str(md.get("ss_sd_model_name", "") or "")
+            tokens: list[str] = []
+            for text in (sdm, path.stem):
+                tokens.extend(
+                    t for t in re.split(r"[^a-z0-9]+", text.lower()) if t
+                )
+            if arch.startswith("anima") or ver == "anima" or "anima" in tokens:
+                return "Anima"
+            names = [k for k in header.keys() if k != "__metadata__"][:400]
+            fingerprint = " ".join(names).lower()
+            if "diffusion_model.blocks" in fingerprint or "lora_unet_blocks" in fingerprint:
+                return "Anima"
+            if any("illustrious" in t for t in tokens):
+                return "Illustrious"
+            if any(re.fullmatch(r"il(v\d\w*)?", t) for t in tokens):
+                return "Illustrious"
+        except Exception:
+            return ""
+        return ""
+
+    def _refresh_lora_base_model_map(self) -> None:
+        """lora_root配下の *.cm-info.json から {lora名.lower(): BaseModel} を再構築する。
+
+        ファイル名は `{lora名}.cm-info.json` のため、stem から `.cm-info` を
+        除去してLoRA名に戻す。失敗ファイルは無視する。
+        cm-info が無い・BaseModel が Unknown のLoRAのうち、ワイルドカードから
+        参照されているものに限り、safetensorsヘッダーでフォールバック判定する
+        （全件ヘッダー読みは遅いため対象を絞る）。
+        """
+        mapping: dict[str, str] = {}
+        lora_root = (self.settings.lora_root or "").strip()
+        root: Path | None = None
+        if lora_root:
+            root = Path(lora_root)
+            if root.exists():
+                try:
+                    for cm_info in root.rglob("*.cm-info.json"):
+                        try:
+                            stem = cm_info.stem  # "{name}.cm-info"
+                            lora_name = stem[:-len(".cm-info")] if stem.endswith(".cm-info") else stem
+                            if not lora_name:
+                                continue
+                            with cm_info.open("r", encoding="utf-8") as handle:
+                                cm_data = json.load(handle)
+                            base_model = str(cm_data.get("BaseModel", "") or "").strip()
+                            if base_model:
+                                mapping[lora_name.lower()] = base_model
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+        if root is not None:
+            try:
+                needed: set[str] = set()
+                for entry in self.entries:
+                    for name in entry.lora_names or []:
+                        key = str(name).strip().lower()
+                        known = (mapping.get(key) or "").strip().lower()
+                        if not known or known == "unknown":
+                            needed.add(key)
+                if needed:
+                    safetensors_index: dict[str, Path] = {}
+                    for safetensors in root.rglob("*.safetensors"):
+                        safetensors_index.setdefault(safetensors.stem.lower(), safetensors)
+                    for key in needed:
+                        target = safetensors_index.get(key)
+                        if target is None:
+                            continue
+                        guessed = self._classify_safetensor_header(target)
+                        if guessed:
+                            mapping[key] = guessed
+            except Exception:
+                pass
+        self._lora_base_model_map = mapping
+        self.list_model.lora_base_model_map = self._lora_base_model_map
+
+    def _entry_base_kinds(self, entry: WildcardEntry) -> set[str]:
+        """エントリが使うLoRAのBaseModel種別 {"illustrious","anima"} を返す。"""
+        kinds: set[str] = set()
+        for name in entry.lora_names or []:
+            bm = (self._lora_base_model_map.get(str(name).strip().lower()) or "").strip().lower()
+            if bm in ("illustrious", "anima"):
+                kinds.add(bm)
+        return kinds
 
     def _populate_lora_cloud(self) -> None:
         self.lora_cloud.clear()
@@ -2527,14 +2825,32 @@ class MainWindow(QMainWindow):
         if item is None:
             return
         self.folder_tree.setCurrentItem(item)
+        folder_key = self._folder_item_key(item)
+        is_fav_node = folder_key == "__favorites__" or folder_key.startswith("__favorites__/")
         menu = QMenu(self)
         open_action = menu.addAction("エクスプローラーで開く")
-        folder_key = item.data(0, Qt.UserRole) or ""
+        new_action = None
+        rename_action = None
+        move_action = None
         delete_action = None
-        if folder_key:
-            delete_action = menu.addAction("このフォルダを削除")
+        if not is_fav_node:
+            menu.addSeparator()
+            new_action = menu.addAction("新規フォルダ...")
+            if folder_key:
+                rename_action = menu.addAction("名前を変更...")
+                move_action = menu.addAction("移動...")
+                delete_action = menu.addAction("このフォルダを削除")
         chosen = menu.exec(self.folder_tree.viewport().mapToGlobal(pos))
         if chosen is None:
+            return
+        if chosen == new_action:
+            self._create_folder_from_tree(folder_key)
+            return
+        if chosen == rename_action:
+            self._rename_folder_from_tree(folder_key)
+            return
+        if chosen == move_action:
+            self._show_move_folder_dialog_for_folder(folder_key)
             return
         if chosen == delete_action:
             self._delete_folder_from_tree(folder_key)
@@ -2544,12 +2860,193 @@ class MainWindow(QMainWindow):
         base = Path(self.settings.library_root)
         # folder_key は POSIX 区切り（"/"）なので OS 非依存に合成する。
         # 以前は folder_key.replace("/", "\\") を使って Windows 専用になっていた。
-        target = base if not folder_key else base / Path(*folder_key.split("/"))
+        if folder_key == "__favorites__":
+            target = base
+        elif is_fav_node:
+            sub = folder_key[len("__favorites__/"):]
+            target = base / Path(*sub.split("/"))
+        else:
+            target = base if not folder_key else base / Path(*folder_key.split("/"))
         from .ui_utils import open_in_file_manager
         if target.exists():
             open_in_file_manager(target)
         else:
             self._show_info("フォルダ", f"フォルダが見つかりません:\n{target}")
+
+    def _create_folder_from_tree(self, parent_key: str) -> None:
+        name, ok = QInputDialog.getText(self, "新規フォルダ", "フォルダ名:")
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            return
+        try:
+            new_key = self.repo.create_folder(self.settings, parent_key, name)
+        except Exception as exc:
+            self._show_error("フォルダ作成エラー", str(exc))
+            return
+        self._rebuild_folder_maps()
+        self.current_folder_prefix = new_key
+        self._rebuild_folder_tree()
+        self.apply_filters()
+        self.statusBar().showMessage(f"フォルダを作成しました: {new_key}", 4000)
+
+    def _rename_folder_from_tree(self, folder_key: str) -> None:
+        if not folder_key:
+            return
+        old_name = folder_key.split("/")[-1]
+        new_name, ok = QInputDialog.getText(self, "フォルダ名の変更", "新しい名前:", text=old_name)
+        if not ok:
+            return
+        new_name = new_name.strip()
+        if not new_name or new_name == old_name:
+            return
+        parent = "/".join(folder_key.split("/")[:-1])
+        new_key = f"{parent}/{new_name}" if parent else new_name
+        try:
+            self.repo.rename_folder(self.settings, folder_key, new_name)
+        except Exception as exc:
+            self._show_error("フォルダ名の変更エラー", str(exc))
+            return
+        self._rewrite_paths_after_folder_op(folder_key, new_key)
+        if self.current_folder_prefix == folder_key:
+            self.current_folder_prefix = new_key
+        elif self.current_folder_prefix.startswith(folder_key + "/"):
+            self.current_folder_prefix = new_key + self.current_folder_prefix[len(folder_key):]
+        self._rebuild_folder_maps()
+        self._rebuild_folder_tree()
+        self.apply_filters()
+        self.statusBar().showMessage(f"フォルダ名を変更しました: {folder_key} → {new_key}", 5000)
+
+    def _show_move_folder_dialog_for_folder(self, src_key: str) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("移動先のフォルダを選択")
+        dialog.setMinimumSize(350, 450)
+        dialog.setStyleSheet(self.styleSheet())
+
+        layout = QVBoxLayout(dialog)
+
+        tree = QTreeWidget()
+        tree.setHeaderHidden(True)
+        tree.setRootIsDecorated(True)
+        tree.setIndentation(12)
+        tree.setAnimated(False)
+        tree.setExpandsOnDoubleClick(True)
+
+        root = QTreeWidgetItem(["(all)"])
+        root.setData(0, Qt.UserRole, "")
+        root.setIcon(0, self.style().standardIcon(QStyle.SP_DirHomeIcon))
+        tree.addTopLevelItem(root)
+
+        self._populate_folder_tree_items(root, "", exclude_key=src_key)
+        tree.expandItem(root)
+
+        layout.addWidget(tree)
+
+        button_layout = QHBoxLayout()
+        move_btn = QPushButton("移動")
+        cancel_btn = QPushButton("キャンセル")
+        move_btn.setDefault(True)
+        button_layout.addStretch()
+        button_layout.addWidget(move_btn)
+        button_layout.addWidget(cancel_btn)
+        layout.addLayout(button_layout)
+
+        cancel_btn.clicked.connect(dialog.reject)
+        move_btn.clicked.connect(dialog.accept)
+
+        tree.setCurrentItem(root)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        selected = tree.currentItem()
+        if not selected:
+            return
+        dest_folder = str(selected.data(0, Qt.UserRole) or "")
+        self._move_folder_to(src_key, dest_folder)
+
+    def _on_folder_tree_move_requested(self, src_key: str, dest_parent_key: str) -> None:
+        self._move_folder_to(src_key, dest_parent_key)
+
+    def _move_folder_to(self, src_key: str, dest_parent_key: str) -> None:
+        if not src_key or src_key == "__favorites__" or src_key.startswith("__favorites__/"):
+            return
+        if dest_parent_key == "__favorites__" or dest_parent_key.startswith("__favorites__/"):
+            self._show_info("フォルダ移動", "お気に入りツリーへは移動できません。")
+            return
+        if dest_parent_key == src_key or dest_parent_key.startswith(src_key + "/"):
+            self._show_info("フォルダ移動", "自分自身または子フォルダへは移動できません。")
+            return
+        name = src_key.split("/")[-1]
+        new_key = f"{dest_parent_key}/{name}" if dest_parent_key else name
+        if new_key == src_key:
+            return
+        result = self._ask_yes_no(
+            "フォルダ移動",
+            f"以下のフォルダを移動しますか？\n\n{src_key}\n→ {new_key}\n\n配下の wildcard とサムネイルも一緒に移動されます。",
+            default_button=QMessageBox.Yes,
+        )
+        if result != QMessageBox.Yes:
+            return
+        try:
+            self.repo.move_folder(self.settings, src_key, dest_parent_key)
+        except Exception as exc:
+            self._show_error("フォルダ移動エラー", str(exc))
+            return
+        self._rewrite_paths_after_folder_op(src_key, new_key)
+        if self.current_folder_prefix == src_key:
+            self.current_folder_prefix = new_key
+        elif self.current_folder_prefix.startswith(src_key + "/"):
+            self.current_folder_prefix = new_key + self.current_folder_prefix[len(src_key):]
+        self._rebuild_folder_maps()
+        self._rebuild_folder_tree()
+        self.apply_filters()
+        self.statusBar().showMessage(f"フォルダを移動しました: {src_key} → {new_key}", 5000)
+
+    def _rewrite_paths_after_folder_op(self, old_key: str, new_key: str) -> None:
+        """フォルダ rename/move 後に、メモリ上のお気に入りとエントリのパスを書き換える。"""
+        library_root = _safe_resolve_path(Path(self.settings.library_root))
+        thumbnail_root = _safe_resolve_path(Path(self.settings.thumbnail_root))
+
+        def _abs(root: Path, key: str) -> str:
+            if not key:
+                return str(root)
+            return str(_safe_resolve_path(root / Path(*key.split("/"))))
+
+        old_abs = _abs(library_root, old_key)
+        new_abs = _abs(library_root, new_key)
+        new_thumb_root_abs = _abs(thumbnail_root, new_key)
+        old_rel_prefix = old_key + "/" if old_key else ""
+
+        # お気に入り(abs_path)のプレフィックスを書き換える
+        # ※ list_model.favorite_paths と同一オブジェクトを共有しているため、
+        # セットを差し替えず in-place で更新する。
+        rewritten_favs: set[str] = set()
+        for path in self.favorite_paths:
+            if path == old_abs or path.startswith(old_abs + os.sep):
+                rewritten_favs.add(new_abs + path[len(old_abs):])
+            else:
+                rewritten_favs.add(path)
+        if rewritten_favs != self.favorite_paths:
+            self.favorite_paths.clear()
+            self.favorite_paths.update(rewritten_favs)
+            self._save_favorites()
+
+        for entry in self.entries:
+            if entry.folder != old_key and not (old_rel_prefix and entry.folder.startswith(old_rel_prefix)):
+                continue
+            rest = entry.rel_path[len(old_rel_prefix):] if old_rel_prefix else entry.rel_path
+            new_rel = f"{new_key}/{rest}" if new_key else rest
+            old_rel = entry.rel_path
+            entry.rel_path = new_rel
+            posix_parent = Path(new_rel).parent.as_posix()
+            entry.folder = "" if posix_parent == "." else posix_parent
+            entry.abs_path = str(_safe_resolve_path(Path(new_abs) / Path(*rest.split("/"))))
+            if entry.thumbnail_path:
+                entry.thumbnail_path = str(_safe_resolve_path(Path(new_thumb_root_abs) / Path(entry.thumbnail_path).name))
+            entry.search_text = entry.search_text.replace(old_rel.lower(), new_rel.lower(), 1)
+        self._rebuild_entry_indexes()
 
     def _delete_folder_from_tree(self, folder_key: str) -> None:
         if not folder_key:
@@ -2723,13 +3220,20 @@ class MainWindow(QMainWindow):
         moved = 0
         for entry in entries:
             try:
-                self.repo.move_entry(self.settings, entry, dest_folder)
+                old_abs = entry.abs_path
+                new_entry = self.repo.move_entry(self.settings, entry, dest_folder)
+                # お気に入りは abs_path で管理しているため、移動後も追従させる
+                if old_abs in self.favorite_paths:
+                    self.favorite_paths.discard(old_abs)
+                    self.favorite_paths.add(new_entry.abs_path)
                 moved += 1
             except Exception as exc:
                 errors.append(f"{entry.name}: {exc}")
 
         if errors:
             self._show_error("移動エラー", f"次のファイルの移動に失敗しました:\n\n{chr(10).join(errors)}")
+        if moved:
+            self._save_favorites()
         self.statusBar().showMessage(f"{moved} 件のカードを「{folder_display}」に移動しました。", 6000)
         self.load_cached_entries()
 
@@ -2754,13 +3258,46 @@ class MainWindow(QMainWindow):
                 if name:
                     selected_loras.add(name)
 
+        model_filter = ""
+        combo = getattr(self, "model_filter_combo", None)
+        if combo is not None:
+            try:
+                model_filter = str(combo.currentData() or "")
+            except Exception:
+                model_filter = ""
+
         def matches(entry: WildcardEntry) -> bool:
-            if self.current_folder_prefix:
+            if self.current_folder_prefix == "__favorites__":
+                # お気に入りフォルダ：お気に入り登録済みのエントリのみ表示
+                if entry.abs_path not in self.favorite_paths:
+                    return False
+            elif self.current_folder_prefix.startswith("__favorites__/"):
+                # お気に入りツリー配下のサブフォルダ：お気に入り かつ 元フォルダ一致
+                if entry.abs_path not in self.favorite_paths:
+                    return False
+                fav_sub = self.current_folder_prefix[len("__favorites__/"):]
+                if entry.folder != fav_sub and not entry.folder.startswith(f"{fav_sub}/"):
+                    return False
+            elif self.current_folder_prefix:
                 if entry.folder != self.current_folder_prefix and not entry.folder.startswith(f"{self.current_folder_prefix}/"):
                     return False
             if selected_loras:
                 if not selected_loras.issubset(set(entry.lora_names)):
                     return False
+            if model_filter == "nolora":
+                if entry.lora_names:
+                    return False
+            elif model_filter in ("illustrious", "anima", "mix"):
+                kinds = self._entry_base_kinds(entry)
+                if model_filter == "illustrious":
+                    if kinds != {"illustrious"}:
+                        return False
+                elif model_filter == "anima":
+                    if kinds != {"anima"}:
+                        return False
+                else:  # mix
+                    if kinds != {"illustrious", "anima"}:
+                        return False
             if not query:
                 return True
             return query in self.search_cache.get(entry.abs_path, "")
@@ -2924,7 +3461,19 @@ class MainWindow(QMainWindow):
         if not entry:
             return
 
+        selected_indexes = self.card_view.selectionModel().selectedIndexes()
+        selected_entries = [self.list_model.entry_at(idx) for idx in selected_indexes]
+        selected_entries = [e for e in selected_entries if e is not None]
+        if not selected_entries:
+            selected_entries = [entry]
+
+        # お気に入りトグル（メニュー最上部）
+        is_fav = entry.abs_path in self.favorite_paths
+        fav_label = "★ お気に入りを解除" if is_fav else "☆ お気に入りに追加"
+
         menu = QMenu(self)
+        fav_action = menu.addAction(fav_label)
+        menu.addSeparator()
         thumb_action = menu.addAction("サムネ生成")
         random_action = menu.addAction("固定プロンプトに入れる")
         menu.addSeparator()
@@ -2944,7 +3493,9 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         delete_action = menu.addAction("削除")
         action = menu.exec(self.card_view.viewport().mapToGlobal(pos))
-        if action == thumb_action:
+        if action == fav_action:
+            self._toggle_favorite(entry)
+        elif action == thumb_action:
             self.generate_thumbnail_for_current()
         elif action == random_action:
             self.open_random_generation(entry)
@@ -3025,17 +3576,20 @@ class MainWindow(QMainWindow):
 
         self._move_entries_to_folder(entries, dest_folder)
 
-    def _populate_folder_tree_items(self, item: QTreeWidgetItem, parent_key: str) -> None:
+    def _populate_folder_tree_items(self, item: QTreeWidgetItem, parent_key: str, exclude_key: str | None = None) -> None:
         children = self.folder_children_map.get(parent_key, set())
         for child_name in sorted(children, key=natural_sort_key):
             child_key = child_name if not parent_key else f"{parent_key}/{child_name}"
+            # 移動元サブツリーは移動先候補から除外する（自分自身・子へは移動不可のため）
+            if exclude_key and (child_key == exclude_key or child_key.startswith(exclude_key + "/")):
+                continue
             child_item = QTreeWidgetItem([child_name])
             child_item.setData(0, Qt.UserRole, child_key)
             child_item.setIcon(0, self.style().standardIcon(QStyle.SP_DirIcon))
             if self.folder_children_map.get(child_key):
                 child_item.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
             item.addChild(child_item)
-            self._populate_folder_tree_items(child_item, child_key)
+            self._populate_folder_tree_items(child_item, child_key, exclude_key=exclude_key)
 
     def _show_lora_context_menu(self, pos) -> None:
         item = self.lora_list.itemAt(pos)
@@ -3176,6 +3730,52 @@ class MainWindow(QMainWindow):
         text = self._prepare_copy_text(self.editor.toPlainText(), include)
         QApplication.clipboard().setText(text, QClipboard.Clipboard)
         self.statusBar().showMessage(f"全文をコピーしました（{'LoRAあり' if include else 'LoRAなし'}）", 3000)
+    # -------------------------------------------------------------------------
+    # お気に入り機能
+    # -------------------------------------------------------------------------
+
+    def _load_favorites(self) -> set[str]:
+        """favorites.json からお気に入りパスのセットを読み込む。"""
+        try:
+            if self.favorites_file.exists():
+                with self.favorites_file.open("r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    return set(data)
+        except Exception as e:
+            log.warning("お気に入りの読み込みに失敗しました: %s", e)
+        return set()
+
+    def _save_favorites(self) -> None:
+        """お気に入りパスのセットを favorites.json に保存する。"""
+        try:
+            self.favorites_file.parent.mkdir(parents=True, exist_ok=True)
+            with self.favorites_file.open("w", encoding="utf-8") as f:
+                json.dump(sorted(self.favorite_paths), f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            log.warning("お気に入りの保存に失敗しました: %s", e)
+
+    def _toggle_favorite(self, entry: WildcardEntry) -> None:
+        """エントリのお気に入り状態をトグルし、ビューを更新する。"""
+        if entry.abs_path in self.favorite_paths:
+            self.favorite_paths.discard(entry.abs_path)
+            msg = f"お気に入りを解除しました: {entry.stem}"
+        else:
+            self.favorite_paths.add(entry.abs_path)
+            msg = f"お気に入りに追加しました: {entry.stem}"
+        self._save_favorites()
+        # カードの星バッジを即座に再描画
+        for row, e in enumerate(self.list_model.entries):
+            if e.abs_path == entry.abs_path:
+                idx = self.list_model.index(row, 0)
+                self.list_model.dataChanged.emit(idx, idx, [Qt.DecorationRole])
+                break
+        # お気に入りフォルダを表示中の場合はフィルターを再適用してカードを更新
+        if self.current_folder_prefix == "__favorites__":
+            self.apply_filters()
+        # ★ お気に入り 配下の階層（元フォルダのミラー）を更新
+        self._refresh_favorites_tree()
+        self.statusBar().showMessage(msg, 3000)
 
     def show_toast(self, message: str) -> None:
         if self.toast_popup is not None:
@@ -3628,7 +4228,8 @@ class MainWindow(QMainWindow):
             self.settings.window_height = self.height()
         self.settings.splitter_sizes = self.splitter.sizes()
         self.settings.detail_splitter_sizes = [420, 520]
-        self.settings.last_folder = self.current_folder_prefix
+        # "__favorites__" 系は仮想フォルダなので保存しない（再起動時に復元不能）
+        self.settings.last_folder = "" if self.current_folder_prefix.startswith("__favorites__") else self.current_folder_prefix
         self.ui_state_store.save(self.settings)
         super().closeEvent(event)
 

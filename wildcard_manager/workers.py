@@ -357,6 +357,7 @@ class UnmadeWildcardScanWorker(QObject):
                     "preview": str(preview) if preview else None,
                     "trained_words": cm_data.get("TrainedWords", []),
                     "model_name": cm_data.get("ModelName", ""),
+                    "base_model": str(cm_data.get("BaseModel", "") or "Unknown"),
                 })
 
             self.finished.emit(results)

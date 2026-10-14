@@ -141,12 +141,34 @@ class LoraCardWidget(QWidget):
     CARD_H = 160
     THUMB_SIZE = 120
 
+    # BaseModel → バッジ背景色（表示名はフルネーム）
+    _BASE_MODEL_COLORS: dict[str, str] = {
+        "illustrious": "#2f6fed",
+        "anima": "#c243c2",
+        "pony": "#2e9e5b",
+        "sdxl 1.0": "#1a8a8a",
+        "sd 1.5": "#6b7280",
+        "noobai": "#d97316",
+        "flux.1 d": "#7c3aed",
+        "qwen": "#0891b2",
+        "ltxv 2.3": "#be123c",
+        "other": "#64748b",
+        "unknown": "#52525b",
+    }
+
+    @classmethod
+    def base_model_color(cls, base_model: str) -> str:
+        key = (base_model or "Unknown").strip().lower()
+        return cls._BASE_MODEL_COLORS.get(key, "#2f6fed")
+
     def __init__(self, item_data: dict, parent=None):
         super().__init__(parent)
         self.item_data = item_data
         self.setFixedSize(self.CARD_W, self.CARD_H)
         self.setCursor(Qt.PointingHandCursor)
         self._hovered = False
+        bm = str(item_data.get("base_model", "") or "Unknown")
+        self.setToolTip(f"{item_data.get('name', '')}\n[{bm}]")
 
     def enterEvent(self, ev):
         self._hovered = True
@@ -194,6 +216,24 @@ class LoraCardWidget(QWidget):
         name_rect = QRect(0, self.THUMB_SIZE + 6, self.CARD_W, 20)
         elided = p.fontMetrics().elidedText(name, Qt.ElideRight, self.CARD_W - 8)
         p.drawText(name_rect, Qt.AlignHCenter | Qt.AlignTop, elided)
+
+        # 左上に BaseModel バッジ（対象モデル識別用）
+        base_model = str(self.item_data.get("base_model", "") or "Unknown").strip() or "Unknown"
+        p.setFont(QFont("Yu Gothic UI", 8, QFont.Bold))
+        fm = p.fontMetrics()
+        badge_h = 18
+        pad_x = 7
+        w = fm.horizontalAdvance(base_model) + pad_x * 2
+        rect = QRect(8, 8, w, badge_h)
+        bg = QColor(self.base_model_color(base_model))
+        bg.setAlpha(175)
+        p.setBrush(bg)
+        border = QColor("#1a2a40")
+        border.setAlpha(175)
+        p.setPen(QPen(border, 1))
+        p.drawRoundedRect(rect, 5, 5)
+        p.setPen(QColor("white"))
+        p.drawText(rect, Qt.AlignCenter, base_model)
 
         p.restore()
 
@@ -244,6 +284,7 @@ class _LoraScanWorker(QObject):
                     "preview": str(preview) if preview else None,
                     "trained_words": cm_data.get("TrainedWords", []),
                     "model_name": cm_data.get("ModelName", ""),
+                    "base_model": str(cm_data.get("BaseModel", "") or "Unknown"),
                 })
             self.finished.emit(results)
         except Exception as exc:
@@ -254,9 +295,11 @@ class UnmadeLoraGridWidget(QWidget):
     """未作成LoRAサムネイルグリッドパネル"""
 
     lora_selected = Signal(dict)
+    sort_mode_changed = Signal(str)
 
     def __init__(self, items: list[dict], lora_root: str = "",
-                 search_haystack: set[str] | None = None, parent=None):
+                 search_haystack: set[str] | None = None,
+                 sort_mode: str = "added_desc", parent=None):
         super().__init__(parent)
         self._all_items = list(items)
         self._cards: list[LoraCardWidget] = []
@@ -265,6 +308,7 @@ class UnmadeLoraGridWidget(QWidget):
         self._show_all: bool = False
         self._scan_thread: QThread | None = None
         self._scan_worker: _LoraScanWorker | None = None
+        self._initial_sort_mode = sort_mode
         self._build()
 
     def _build(self):
@@ -299,6 +343,10 @@ class UnmadeLoraGridWidget(QWidget):
         self._sort_combo.addItem("フォルダ順", "folder")
         self._sort_combo.setFixedHeight(30)
         self._sort_combo.currentIndexChanged.connect(self._apply_sort)
+        # 前回のソートモードを復元
+        idx = self._sort_combo.findData(self._initial_sort_mode)
+        if idx >= 0:
+            self._sort_combo.setCurrentIndex(idx)
         layout.addWidget(self._sort_combo)
 
         self._chk_show_all = QCheckBox("全LoRAを表示（作成済み含む）")
@@ -313,6 +361,21 @@ class UnmadeLoraGridWidget(QWidget):
         self._search.textChanged.connect(self._apply_filter)
         layout.addWidget(self._search)
         _setup_japanese_context_menu(self._search)
+
+        self._model_combo = QComboBox()
+        self._model_combo.addItem("モデル: すべて", "")
+        self._model_combo.addItem("Illustrious", "illustrious")
+        self._model_combo.addItem("Anima", "anima")
+        self._model_combo.addItem("Pony", "pony")
+        self._model_combo.addItem("SDXL 1.0", "sdxl 1.0")
+        self._model_combo.addItem("SD 1.5", "sd 1.5")
+        self._model_combo.addItem("NoobAI", "noobai")
+        self._model_combo.addItem("Flux.1 D", "flux.1 d")
+        self._model_combo.addItem("Other", "other")
+        self._model_combo.addItem("Unknown", "unknown")
+        self._model_combo.setFixedHeight(30)
+        self._model_combo.currentIndexChanged.connect(self._apply_filter)
+        layout.addWidget(self._model_combo)
 
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
@@ -343,23 +406,31 @@ class UnmadeLoraGridWidget(QWidget):
     def _on_click(self, item_data: dict, card: LoraCardWidget):
         self.lora_selected.emit(item_data)
 
-    def _apply_filter(self, text: str):
-        q = text.strip().lower()
+    def _apply_filter(self, *_):
+        q = self._search.text().strip().lower() if hasattr(self, "_search") else ""
+        model_filter = ""
+        if hasattr(self, "_model_combo"):
+            model_filter = (self._model_combo.currentData() or "").strip().lower()
         for card in self._cards:
             name = card.item_data.get("name", "").lower()
-            card.setVisible(q in name if q else True)
+            ok_name = (q in name) if q else True
+            ok_model = True
+            if model_filter:
+                ok_model = (str(card.item_data.get("base_model", "") or "Unknown").strip().lower() == model_filter)
+            card.setVisible(ok_name and ok_model)
         self._grid_widget.adjustSize()
         self._grid_widget.update()
 
     def _apply_sort(self):
         """プルダウンで選択された並び順で _all_items を並び替え、グリッドを作り直す"""
-        if not hasattr(self, "_sort_combo"):
+        if not hasattr(self, "_sort_combo") or not hasattr(self, "_flow"):
             return
         mode = self._sort_combo.currentData()
         if not mode:
             return
         self._all_items.sort(key=lambda item: self._sort_key(item, mode))
         self._rebuild_grid()
+        self.sort_mode_changed.emit(mode)
 
     def _rebuild_grid(self):
         for card in self._cards:
@@ -495,12 +566,16 @@ class CharacterTabContent(QWidget):
 
     def __init__(self, settings: AppSettings, repo: WildcardRepository,
                  api: ThumbnailApiClient, folder_map: dict[str, set[str]],
-                 default_root: str = "", parent=None):
+                 default_root: str = "", parent=None,
+                 on_create=None, on_cancel=None):
         super().__init__(parent)
         self._settings = settings
         self._repo = repo
         self._api = api
         self._folder_map = folder_map
+        # ダイアログ下部の [キャンセル][作成] をサイドバー最下部に置くためのコールバック
+        self._dlg_on_create = on_create
+        self._dlg_on_cancel = on_cancel
 
         # 衣装データ
         self._costumes: list[dict] = []
@@ -758,6 +833,24 @@ class CharacterTabContent(QWidget):
         g.addWidget(self._btn_gen_all)
 
         g.addStretch(1)
+
+        # ダイアログ下部の [キャンセル][作成]（サイズ・見た目はそのまま右列最下部へ）
+        if self._dlg_on_create is not None:
+            brow = QHBoxLayout()
+            brow.setContentsMargins(0, 0, 0, 0)
+            brow.setSpacing(8)
+            btn_c = QPushButton("キャンセル")
+            btn_c.setFixedHeight(36)
+            btn_c.setMinimumWidth(80)
+            if self._dlg_on_cancel is not None:
+                btn_c.clicked.connect(self._dlg_on_cancel)
+            brow.addWidget(btn_c)
+            btn_ok = QPushButton("作成")
+            btn_ok.setFixedHeight(36)
+            btn_ok.setMinimumWidth(80)
+            btn_ok.clicked.connect(self._dlg_on_create)
+            brow.addWidget(btn_ok)
+            g.addLayout(brow)
         return w
 
     def _make_folder(self, default_root: str = "") -> _FolderPicker:
@@ -1354,6 +1447,8 @@ class NewWildcardDialog(QDialog):
         self.tabs: QTabWidget | None = None
         # JSONドロップオーバーレイ
         self._json_overlay: QLabel | None = None
+        # トースト重複防止用（前回分を即時破棄する）
+        self._toast: QLabel | None = None
         # 未作成LoRAグリッド
         self._unmade_grid: UnmadeLoraGridWidget | None = None
         self._current_unmade_item: dict | None = None
@@ -1403,16 +1498,26 @@ class NewWildcardDialog(QDialog):
             QListWidget::item:hover{background:#1d2630}
             QScrollArea{background:transparent;border:none}
             QSplitter::handle{background:#2a3440}
+            QTabWidget::pane{border:0;margin:0;padding:0}
             QRadioButton{color:#edf2f7;font-size:11px;spacing:6px}
             QRadioButton::indicator{width:14px;height:14px;border:2px solid #4a5568;border-radius:8px;background:#161b22}
             QRadioButton::indicator:checked{border-color:#2e5fb8;background:#2e5fb8}
             QRadioButton::indicator:hover{border-color:#3a71c6}
         """)
 
+    def _tab_footer_callbacks(self):
+        """各タブ右列下部の [キャンセル][作成] 用コールバック。
+        未作成LoRAモードは閉じる(accept)、通常は破棄確認(reject)。"""
+        if self._unmade_items is not None:
+            on_cancel = self._on_close_clicked
+        else:
+            on_cancel = self._on_cancel_clicked
+        return {"on_create": self._do_create, "on_cancel": on_cancel}
+
     def _build(self):
         root = QVBoxLayout(self)
         root.setContentsMargins(10, 10, 10, 10)
-        root.setSpacing(6)
+        root.setSpacing(0)
 
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
@@ -1421,7 +1526,7 @@ class NewWildcardDialog(QDialog):
         # 初期キャラクタータブ (index 0)
         char_tab = CharacterTabContent(
             self._settings, self._repo, self._api, self._folder_map,
-            parent=self,
+            parent=self, **self._tab_footer_callbacks(),
         )
         # 保存先変更時に settings.random_character_root も更新
         char_tab.inp_folder._edit.textChanged.connect(self._on_character_folder_changed)
@@ -1434,6 +1539,7 @@ class NewWildcardDialog(QDialog):
             ct = CharacterTabContent(
                 self._settings, self._repo, self._api, self._folder_map,
                 default_root=save_path, parent=self,
+                **self._tab_footer_callbacks(),
             )
             plus_idx = self.tabs.count()
             self.tabs.insertTab(plus_idx, ct, name)
@@ -1455,11 +1561,13 @@ class NewWildcardDialog(QDialog):
                 self._unmade_items,
                 lora_root=self._settings.lora_root,
                 search_haystack=haystack,
+                sort_mode=self._settings.lora_sort_mode,
             )
             self._unmade_grid.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             self._unmade_grid.setMinimumWidth(300)
             self._unmade_grid.setMaximumWidth(360)
             self._unmade_grid.lora_selected.connect(self._on_unmade_lora_clicked)
+            self._unmade_grid.sort_mode_changed.connect(self._on_lora_sort_mode_changed)
             self._unmade_grid.setContentsMargins(0, 0, 6, 0)
             self.tabs.setContentsMargins(6, 0, 0, 0)
             splitter.addWidget(self._unmade_grid)
@@ -1469,32 +1577,8 @@ class NewWildcardDialog(QDialog):
         else:
             root.addWidget(self.tabs, 1)
 
-        # ボタン行
-        btn_row = QHBoxLayout()
-        btn_row.setContentsMargins(0, 8, 0, 0)
-        btn_row.setSpacing(8)
-        btn_row.addStretch(1)
-
-        self.btn_cancel = QPushButton("キャンセル")
-        self.btn_cancel.setFixedHeight(36)
-        self.btn_cancel.setMinimumWidth(80)
-        self.btn_cancel.clicked.connect(self._on_cancel_clicked)
-        if self._unmade_items is not None:
-            self.btn_cancel.setVisible(False)
-        btn_row.addWidget(self.btn_cancel)
-        if self._unmade_items is not None:
-            self.btn_close = QPushButton("キャンセル")
-            self.btn_close.setFixedHeight(36)
-            self.btn_close.setMinimumWidth(80)
-            self.btn_close.clicked.connect(self._on_close_clicked)
-            btn_row.addWidget(self.btn_close)
-        self.btn_create = QPushButton("作成")
-        self.btn_create.setFixedHeight(36)
-        self.btn_create.setMinimumWidth(80)
-        self.btn_create.clicked.connect(self._do_create)
-        btn_row.addWidget(self.btn_create)
-        root.addLayout(btn_row)
-
+        # [キャンセル][作成] は各タブ右列（サイドバー）最下部に配置するため、
+        # ダイアログ下部のボタン行は持たない。タブ領域が下端まで伸びる。
         self.tabs.currentChanged.connect(self._tab_changed)
         self._tab_changed(0)
 
@@ -1555,6 +1639,10 @@ class NewWildcardDialog(QDialog):
                 tab.inp_lora.setPlainText(f"<lora:{lora_name}:1>")
                 self._update_baseline_snapshot()
 
+    def _on_lora_sort_mode_changed(self, mode: str):
+        """LoRAグリッドのソートモード変更時にsettingsに保存"""
+        self._settings.lora_sort_mode = mode
+
     # ── タグコールバック (TagEditorWidgetから) ───────────────────
 
     def _update_delete_button_state(self):
@@ -1610,22 +1698,37 @@ class NewWildcardDialog(QDialog):
         ev.ignore()
 
     def _show_toast(self, message: str, duration_ms: int = 1800):
+        if self._toast is not None:
+            try:
+                self._toast.hide()
+                self._toast.deleteLater()
+            except RuntimeError:
+                pass
+            self._toast = None
         toast = QLabel(message, self)
+        self._toast = toast
         toast.setWordWrap(True)
         toast.setStyleSheet(
             "background:#1f2a37;color:#e6edf3;border:1px solid #3a4654;"
             "border-radius:8px;padding:10px 16px;font-size:13px;"
         )
-        toast.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        toast.setAlignment(Qt.AlignCenter)
         max_w = max(200, self.width() - 48)
         toast.setMaximumWidth(max_w)
         toast.adjustSize()
-        x = max(12, self.width() - toast.width() - 24)
-        y = max(12, self.height() - toast.height() - 24)
+        x = max(12, (self.width() - toast.width()) // 2)
+        y = max(12, (self.height() - toast.height()) // 2)
         toast.move(x, y)
         toast.show()
         toast.raise_()
-        QTimer.singleShot(duration_ms, toast.deleteLater)
+        def _cleanup():
+            try:
+                toast.deleteLater()
+            except RuntimeError:
+                pass
+            if self._toast is toast:
+                self._toast = None
+        QTimer.singleShot(duration_ms, _cleanup)
 
     def _on_cancel_clicked(self):
         if self._confirm_discard_changes():
@@ -1790,6 +1893,7 @@ class NewWildcardDialog(QDialog):
         tab_widget = CharacterTabContent(
             self._settings, self._repo, self._api, self._folder_map,
             default_root=save_path, parent=self,
+            **self._tab_footer_callbacks(),
         )
         plus_idx = count - 1
         self.tabs.insertTab(plus_idx, tab_widget, name)
