@@ -7,6 +7,49 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QObject, QRunnable, QSize, Signal, Slot
 from PySide6.QtGui import QImage, QImageReader
 
+from . import theme
+
+# キャラ絵は顔が上寄りにあるので、クロップは上を残す方針にする（取りすぎると
+# 目線が切れて別キャラに見える）。0.30 = はみ出しの3割を上で切り、7割を足元から。
+CROP_TOP_KEEP = 0.30
+
+
+def cover_crop(image: QImage, box_w: int, box_h: int) -> QImage:
+    """画像を引き伸ばさず box を覆い、はみ出しを切る（高さは上を残して詰める）。"""
+    if image.isNull() or box_w <= 0 or box_h <= 0:
+        return image
+    src_w, src_h = image.width(), image.height()
+    if (src_w, src_h) == (box_w, box_h):
+        return image
+    scale = max(box_w / src_w, box_h / src_h)
+    scaled = image.scaled(QSize(max(1, round(src_w * scale)), max(1, round(src_h * scale))),
+                          Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+    x0 = max(0, round((scaled.width() - box_w) * 0.5))
+    y0 = max(0, round((scaled.height() - box_h) * CROP_TOP_KEEP))
+    return scaled.copy(x0, y0, box_w, box_h)
+
+
+def decode_cover_image(path: str, box_w: int, box_h: int) -> QImage:
+    """アスペクトを保ったまま box いっぱいにデコードする。
+
+    `QImageReader.setScaledSize` は縮率を無視して引き伸ばすので、覆う側の縮率を
+    先計算して渡してから余りを切る（フルデコード→後クロップより安上がり）。
+    尺寸が読めないファイルは従来どおり box 指定で縮む。
+    """
+    reader = QImageReader(path)
+    reader.setAutoTransform(True)
+    size = reader.size()
+    if size.isValid() and size.width() > 0 and size.height() > 0:
+        scale = max(box_w / size.width(), box_h / size.height())
+        reader.setScaledSize(QSize(max(1, round(size.width() * scale)),
+                                   max(1, round(size.height() * scale))))
+    else:
+        reader.setScaledSize(QSize(box_w, box_h))
+    image = reader.read()
+    if image.isNull():
+        return image
+    return cover_crop(image, box_w, box_h)
+
 # サムネイル生成側（SingleThumbnailWorker / shutil.copy2 等）と一覧表示側が
 # 非同期で競合した場合（ファイルが書き込み中 / まだ存在しない）に備えたリトライ設定。
 THUMBNAIL_READ_RETRY_COUNT = 3
@@ -53,17 +96,14 @@ class ThumbnailLoadTask(_CancellableRunnable):
         if self.is_cancelled:
             return None
         width = max(80, self.thumbnail_size)
-        height = int(width * 1.5)
+        height = int(width * theme.CARD_ICON_RATIO)
         # 書き込み中（0byte / 一部のみ書き込まれた状態）のファイルを弾く。
         try:
             if os.path.getsize(self.thumbnail_path) <= 0:
                 return None
         except OSError:
             return None
-        reader = QImageReader(self.thumbnail_path)
-        reader.setAutoTransform(True)
-        reader.setScaledSize(QSize(width, height))
-        image = reader.read()
+        image = decode_cover_image(self.thumbnail_path, width, height)
         if image.isNull():
             return None
         return image

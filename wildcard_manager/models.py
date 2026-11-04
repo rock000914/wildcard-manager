@@ -49,7 +49,8 @@ class AppSettings:
     window_height: int = 1040
     window_maximized: bool = False
     splitter_sizes: list[int] = field(default_factory=lambda: [260, 1020, 520])
-    detail_splitter_sizes: list[int] = field(default_factory=lambda: [520, 420])
+    # ツリーとLoRAフィルタの縦配分は折半。従来(420:880≈3:7)はLoRA側ばかり広く、ツリーが常に不足気味だった
+    left_split_sizes: list[int] = field(default_factory=lambda: [460, 460])
     last_folder: str = ""
     sort_mode: str = "name_asc"
     sort_key: str = "name"

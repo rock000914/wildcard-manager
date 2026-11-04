@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import theme
 from .api import ThumbnailApiClient
 from .models import AppSettings
 from .repository import WildcardRepository
@@ -37,15 +38,17 @@ from .widgets import NoWheelComboBox
 log = logging.getLogger(__name__)
 
 # UI constants (must match main_window.py values)
-UI_RADIUS = 10
+UI_RADIUS = theme.RADIUS_PANEL
 UI_CARD_MARGIN_TOP = 18
-UI_CARD_MARGIN_X = 12
-UI_CARD_PADDING_X = 14
-UI_CARD_PADDING_Y = 12
-UI_CONTROL_HEIGHT = 32
-UI_BUTTON_HEIGHT = 30
-UI_BUTTON_PADDING_X = 14
-UI_SECTION_SPACING = 16
+UI_CARD_MARGIN_X = theme.SPACE_LG - 4
+UI_CARD_PADDING_X = theme.SPACE_LG - 2
+UI_CARD_PADDING_Y = theme.SPACE_LG - 4
+UI_CONTROL_HEIGHT = theme.INPUT_HEIGHT - 2
+# setFixedHeight は外側寸法（border 1px*2 込み）。styleSheet の min/max-height は
+# content 寸法なので、同じ値を渡すと2px短いボタンになる（ここでは外側だけを保持する）
+UI_BUTTON_OUTER_HEIGHT = theme.BUTTON_HEIGHT
+UI_BUTTON_PADDING_X = theme.BUTTON_PADDING_X
+UI_SECTION_SPACING = theme.SPACE_LG
 
 
 class SettingsDialog(QDialog):
@@ -56,73 +59,46 @@ class SettingsDialog(QDialog):
         self.setWindowTitle("設定")
         self.resize(1120, 820)
         self.setMinimumSize(1040, 760)
+        # 基底は app_style()（app.py で適用済み）。ここでは app_style に無い
+        # タブの外観と、この画面だけの寸法指定だけ持つ。
         self.setStyleSheet(
             f"""
-            QDialog {{
-                background: #0f1216;
-                color: #edf2f7;
-            }}
-            QLabel {{
-                color: #edf2f7;
-            }}
             QGroupBox {{
-                border: 1px solid #2a3440;
-                border-radius: {UI_RADIUS}px;
-                margin-top: {UI_CARD_MARGIN_TOP}px;
-                color: #edf2f7;
+                border: 1px solid {theme.BORDER};
+                border-radius: {theme.RADIUS_PANEL}px;
+                margin-top: {theme.SPACE}px;
+                color: {theme.TEXT};
                 font-weight: 600;
             }}
             QGroupBox::title {{
                 subcontrol-origin: margin;
-                left: {UI_CARD_MARGIN_X}px;
+                left: {theme.SPACE}px;
                 padding: 0 4px;
             }}
             QTabWidget::pane {{
-                border: 1px solid #2a3440;
-                border-radius: {UI_RADIUS}px;
+                border: 1px solid {theme.BORDER};
+                border-radius: {theme.RADIUS_PANEL}px;
                 top: -1px;
-                background: #0f1216;
+                background: {theme.PANEL_MAIN};
             }}
             QTabBar::tab {{
-                background: #151a21;
-                color: #dce5ef;
-                border: 1px solid #2a3440;
+                background: {theme.PANEL_SIDE};
+                color: {theme.TEXT_MUTED};
+                border: 1px solid {theme.BORDER};
                 border-bottom: none;
-                border-top-left-radius: {UI_RADIUS}px;
-                border-top-right-radius: {UI_RADIUS}px;
+                border-top-left-radius: {theme.RADIUS_CONTROL}px;
+                border-top-right-radius: {theme.RADIUS_CONTROL}px;
                 padding: 7px 14px;
                 margin-right: 4px;
             }}
             QTabBar::tab:selected {{
-                background: #1d2630;
-                color: #ffffff;
+                background: {theme.PANEL_MAIN};
+                color: {theme.TEXT};
+                border-color: {theme.ACCENT};
             }}
-            QLineEdit, QTextEdit, QPlainTextEdit, QListWidget, QTreeWidget, QListView, QComboBox, QSpinBox {{
-                background: #161b22;
-                border: 1px solid #2a3440;
-                border-radius: {UI_RADIUS}px;
-                color: #edf2f7;
-                padding: 6px 10px;
-                min-height: {UI_CONTROL_HEIGHT}px;
-            }}
-            QPushButton {{
-                background: #2e5fb8;
-                border: 1px solid #2e5fb8;
-                border-radius: {UI_RADIUS}px;
-                color: white;
-                padding: 0px {UI_BUTTON_PADDING_X}px;
-                min-height: {UI_BUTTON_HEIGHT}px;
-                max-height: {UI_BUTTON_HEIGHT}px;
-                height: {UI_BUTTON_HEIGHT}px;
-                font-size: 11px;
-            }}
-            QPushButton:hover {{
-                background: #3a71c6;
-                border-color: #3a71c6;
-            }}
-            QPushButton:pressed {{
-                background: #1e4a9a;
-                border-color: #1e4a9a;
+            QTabBar::tab:hover:!selected {{
+                background: {theme.GHOST_HOVER};
+                color: {theme.TEXT};
             }}
             """
         )
@@ -146,7 +122,7 @@ class SettingsDialog(QDialog):
         self.api_base_url = QLineEdit(settings.api_base_url)
         self.api_test_button = QPushButton("接続確認")
         self.api_test_button.clicked.connect(self._test_api_connection)
-        self.api_test_button.setFixedHeight(UI_BUTTON_HEIGHT)
+        self.api_test_button.setFixedHeight(UI_BUTTON_OUTER_HEIGHT)
         self.api_timeout_sec = QLineEdit(str(settings.api_timeout_sec))
         self.generation_prompt_prefix = QPlainTextEdit(settings.generation_prompt_prefix)
         self.generation_prompt_prefix.setMaximumHeight(90)
@@ -196,10 +172,10 @@ class SettingsDialog(QDialog):
         self.random_checkpoint_name.setCurrentText(settings.random_checkpoint_name)
         self.random_refresh_checkpoints_button = QPushButton("候補更新")
         self.random_refresh_checkpoints_button.clicked.connect(self._refresh_random_checkpoint_list)
-        self.random_refresh_checkpoints_button.setFixedHeight(UI_BUTTON_HEIGHT)
+        self.random_refresh_checkpoints_button.setFixedHeight(UI_BUTTON_OUTER_HEIGHT)
         self.random_checkpoint_status = QLabel("API から候補を取得できます")
         self.random_checkpoint_status.setWordWrap(True)
-        self.random_checkpoint_status.setStyleSheet("color: #e7b65c;")
+        self.random_checkpoint_status.setStyleSheet(f"color: {theme.WARNING};")
         self.random_adetailer_enabled = QCheckBox("ADetailer を使う")
         self.random_adetailer_enabled.setChecked(settings.random_adetailer_enabled)
 
@@ -249,7 +225,7 @@ class SettingsDialog(QDialog):
         common_scroll = QScrollArea()
         common_scroll.setWidgetResizable(True)
         common_scroll.setFrameShape(QFrame.NoFrame)
-        common_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        common_scroll.setStyleSheet(theme.scroll_area())
         common_content = QWidget()
         common_content_layout = QVBoxLayout(common_content)
         common_content_layout.setContentsMargins(0, 0, 0, 0)
@@ -289,7 +265,7 @@ class SettingsDialog(QDialog):
         management_form.addRow("取込元サムネイル", self.source_thumbnail_root["widget"])
         self.source_thumbnail_status = QLabel()
         self.source_thumbnail_status.setWordWrap(True)
-        self.source_thumbnail_status.setStyleSheet("color: #e7b65c;")
+        self.source_thumbnail_status.setStyleSheet(f"color: {theme.WARNING};")
         self.source_thumbnail_status.setMinimumHeight(72)
         self.source_thumbnail_status.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         self.source_thumbnail_status.setAlignment(Qt.AlignTop | Qt.AlignLeft)
@@ -305,7 +281,7 @@ class SettingsDialog(QDialog):
         thumbnail_scroll = QScrollArea()
         thumbnail_scroll.setWidgetResizable(True)
         thumbnail_scroll.setFrameShape(QFrame.NoFrame)
-        thumbnail_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        thumbnail_scroll.setStyleSheet(theme.scroll_area())
         thumbnail_content = QWidget()
         thumbnail_content_layout = QVBoxLayout(thumbnail_content)
         thumbnail_content_layout.setContentsMargins(0, 0, 0, 0)
@@ -339,7 +315,7 @@ class SettingsDialog(QDialog):
         random_scroll = QScrollArea()
         random_scroll.setWidgetResizable(True)
         random_scroll.setFrameShape(QFrame.NoFrame)
-        random_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        random_scroll.setStyleSheet(theme.scroll_area())
         random_content = QWidget()
         random_content_layout = QVBoxLayout(random_content)
         random_content_layout.setContentsMargins(0, 0, 0, 0)
@@ -363,6 +339,9 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(random_tab, "ランダム生成の初期値")
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        # 決定=Primary / キャンセル=Secondary の階層はダイアログでも揃える
+        buttons.button(QDialogButtonBox.Ok).setStyleSheet(theme.button("primary"))
+        buttons.button(QDialogButtonBox.Cancel).setStyleSheet(theme.button("secondary"))
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -418,65 +397,29 @@ class SettingsDialog(QDialog):
         _setup_japanese_context_menu(line_edit)
         button = QPushButton("参照")
         button.setFixedWidth(72)
-        button.setFixedHeight(UI_BUTTON_HEIGHT)
+        button.setFixedHeight(UI_BUTTON_OUTER_HEIGHT)
         button.clicked.connect(lambda: self._pick_directory(line_edit))
         layout.addWidget(line_edit)
         layout.addWidget(button)
         return {"widget": row, "line_edit": line_edit}
 
     def _style_line_field(self, widget: QLineEdit) -> None:
+        # 外観は app_style の input_field() に一任し、ここでは寸法の下限だけ持つ
         widget.setMinimumHeight(UI_CONTROL_HEIGHT)
-        widget.setStyleSheet(
-            """
-            QLineEdit {
-                background: #1a1d22;
-                border: 1px solid #2d3640;
-                border-radius: 10px;
-                color: #eef2f7;
-                padding: 6px 10px;
-                font-size: 13px;
-            }
-            """
-        )
 
     def _style_text_field(self, widget: QPlainTextEdit) -> None:
+        # 複数行は app_style の 1行用 padding だと詰まるため、余白だけ上書きする
         widget.setMinimumHeight(84)
         widget.setStyleSheet(
-            """
-            QPlainTextEdit {
-                background: #1a1d22;
-                border: 1px solid #2d3640;
-                border-radius: 10px;
-                color: #eef2f7;
-                padding: 8px 10px;
-                font-size: 13px;
-            }
+            f"""
+            QPlainTextEdit {{
+                padding: {theme.SPACE}px 10px;
+            }}
             """
         )
 
     def _style_combo_field(self, widget: QComboBox) -> None:
         widget.setMinimumHeight(UI_CONTROL_HEIGHT)
-        widget.setStyleSheet(
-            """
-            QComboBox {
-                background: #1a1d22;
-                border: 1px solid #2d3640;
-                border-radius: 10px;
-                color: #eef2f7;
-                padding: 4px 10px;
-                font-size: 13px;
-            }
-            QComboBox::drop-down {
-                border: none;
-                width: 24px;
-            }
-            QComboBox QAbstractItemView {
-                background: #1a1d22;
-                color: #eef2f7;
-                selection-background-color: #2b6cb0;
-            }
-            """
-        )
 
     def _pick_directory(self, line_edit: QLineEdit) -> None:
         selected = QFileDialog.getExistingDirectory(self, "フォルダ選択", line_edit.text())
@@ -590,7 +533,7 @@ class SettingsDialog(QDialog):
         try:
             checkpoints = self.api.list_checkpoints(self._candidate_settings())
         except Exception as exc:
-            self.random_checkpoint_status.setStyleSheet("color: #ef8d8d;")
+            self.random_checkpoint_status.setStyleSheet(f"color: {theme.DANGER_TEXT};")
             self.random_checkpoint_status.setText(f"候補一覧を取得できません: {exc}")
             return
 
@@ -604,10 +547,10 @@ class SettingsDialog(QDialog):
                 self.random_checkpoint_name.addItem(current)
             self.random_checkpoint_name.setCurrentText(current)
             if checkpoints:
-                self.random_checkpoint_status.setStyleSheet("color: #7fd48e;")
+                self.random_checkpoint_status.setStyleSheet(f"color: {theme.OK};")
                 self.random_checkpoint_status.setText(f"{len(checkpoints)} 件の checkpoint 候補を取得しました")
             else:
-                self.random_checkpoint_status.setStyleSheet("color: #e7b65c;")
+                self.random_checkpoint_status.setStyleSheet(f"color: {theme.WARNING};")
                 self.random_checkpoint_status.setText("checkpoint 候補が見つかりませんでした")
         finally:
             self.random_checkpoint_name.blockSignals(False)
@@ -616,7 +559,7 @@ class SettingsDialog(QDialog):
         try:
             inspection = self.repo.inspect_source_thumbnail_roots(self._candidate_settings())
         except Exception as exc:
-            self.source_thumbnail_status.setStyleSheet("color: #ef8d8d;")
+            self.source_thumbnail_status.setStyleSheet(f"color: {theme.DANGER_TEXT};")
             self.source_thumbnail_status.setText(f"エラー: {exc}")
             return
 
@@ -624,18 +567,18 @@ class SettingsDialog(QDialog):
         existing = inspection["existing_roots"]
         configured_exists = inspection["configured_exists"]
         if configured_exists:
-            self.source_thumbnail_status.setStyleSheet("color: #7fd48e;")
+            self.source_thumbnail_status.setStyleSheet(f"color: {theme.OK};")
             self.source_thumbnail_status.setText(f"OK: 設定パスが存在します\n{configured}")
             return
         if existing:
-            self.source_thumbnail_status.setStyleSheet("color: #e7b65c;")
+            self.source_thumbnail_status.setStyleSheet(f"color: {theme.WARNING};")
             self.source_thumbnail_status.setText(
                 "設定パスは見つかりませんが、存在する候補が見つかりました\n"
                 f"設定パス: {configured}\n"
                 f"候補: {existing[0]}"
             )
             return
-        self.source_thumbnail_status.setStyleSheet("color: #ef8d8d;")
+        self.source_thumbnail_status.setStyleSheet(f"color: {theme.DANGER_TEXT};")
         self.source_thumbnail_status.setText(
             "設定パスも候補パスも見つかりません\n"
             f"設定パス: {configured}"
@@ -705,7 +648,7 @@ class SettingsDialog(QDialog):
             window_height=base_settings.window_height,
             window_maximized=base_settings.window_maximized,
             splitter_sizes=base_settings.splitter_sizes,
-            detail_splitter_sizes=base_settings.detail_splitter_sizes,
+            left_split_sizes=base_settings.left_split_sizes,
             last_folder=base_settings.last_folder,
             sort_mode=base_settings.sort_mode,
             sort_key=base_settings.sort_key,

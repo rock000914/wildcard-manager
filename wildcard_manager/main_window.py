@@ -8,7 +8,7 @@ import logging
 import os
 import re
 import struct
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QHBoxLayout,
+    QHeaderView,
     QInputDialog,
     QLayout,
     QGroupBox,
@@ -48,6 +49,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QScrollArea,
+    QSlider,
     QSplitter,
     QSpinBox,
     QStatusBar,
@@ -65,10 +67,12 @@ from PySide6.QtWidgets import (
 
 from .api import ThumbnailApiClient
 from .config import SettingsStore, UIStateStore
+from .icons import icon_folder, icon_home, icon_lora, icon_new_card, icon_panel, icon_random, icon_settings, icon_star, icon_text_size
+from . import theme
 from .models import AppSettings, WildcardEntry
-from .repository import CONFLICT_POLICIES, OperationCancelledError, WildcardRepository, sidecar_metadata_path, strip_lora_tags, parse_prompt_tags, _safe_resolve_path
-from .thumbnail_model import ThumbnailListModel, ThumbnailItemDelegate, ThumbnailCardDelegate, CARD_ICON_RATIO, CARD_TITLE_HEIGHT, CARD_FRAME_PADDING
-from .thumbnail_workers import ThumbnailLoadSignals, ThumbnailLoadTask, EntryContentLoadSignals, EntryContentLoadTask, PreviewLoadSignals, PreviewLoadTask
+from .repository import CONFLICT_POLICIES, OperationCancelledError, WildcardRepository, ensure_thumbnail_destination, next_gallery_slot, sidecar_metadata_path, strip_lora_tags, parse_prompt_tags, extract_lora_names, _safe_resolve_path
+from .thumbnail_model import ThumbnailListModel, ThumbnailItemDelegate, ThumbnailCardDelegate, CARD_TITLE_HEIGHT, CARD_FRAME_PADDING, lora_name_key, thumbnail_paths_equal
+from .thumbnail_workers import ThumbnailLoadSignals, ThumbnailLoadTask, EntryContentLoadSignals, EntryContentLoadTask, PreviewLoadSignals, PreviewLoadTask, cover_crop
 from .tag_editor import FlowLayout, TagChip, TagEditorWidget
 from .new_wildcard_dialog import NewWildcardDialog, PREVIEW_THUMB_SUBDIR
 from .single_thumbnail_worker import SingleThumbnailWorker
@@ -118,19 +122,45 @@ THUMBNAIL_SIZE_MIN = 80
 THUMBNAIL_SIZE_MAX = 720
 THUMBNAIL_SIZE_STEP = 16
 UI_FONT_FAMILIES = ["Yu Gothic UI", "Yu Gothic", "Meiryo UI", "Meiryo", "Segoe UI", "Noto Sans CJK JP", "MS Gothic"]
-UI_OUTER_MARGIN = 12
-UI_SECTION_SPACING = 12
-UI_CARD_MARGIN_TOP = 12
-UI_CARD_MARGIN_X = 12
-UI_CARD_PADDING_X = 14
-UI_CARD_PADDING_Y = 12
-UI_RADIUS = 10
-UI_CONTROL_HEIGHT = 32
-UI_BUTTON_HEIGHT = 30
-UI_BUTTON_PADDING_X = 8
+# 寸法は theme 由来に一本化（仕様: 8pxグリッド / ボタン34〜38 / アイコンボタン32〜36四方 / 入力34〜38）
+# スタイルシートの min/max-height は content rect 指定で border(1px*2) が加算される。
+# よって setFixedSize 系の外側寸法から2を引いた値が content 用になる。
+UI_OUTER_MARGIN = theme.SPACE + theme.SPACE_SM          # 12
+UI_SECTION_SPACING = theme.SPACE + theme.SPACE_SM       # 12
+UI_CARD_MARGIN_TOP = theme.SPACE + theme.SPACE_SM       # 12
+UI_CARD_MARGIN_X = theme.SPACE + theme.SPACE_SM         # 12
+UI_CARD_PADDING_X = theme.SPACE + theme.SPACE_SM        # 12
+UI_CARD_PADDING_Y = theme.SPACE + theme.SPACE_SM        # 12
+UI_RADIUS = theme.RADIUS_CARD                           # 8
+UI_CONTROL_HEIGHT = theme.INPUT_HEIGHT - 2              # 34 → 外側36
+UI_BUTTON_HEIGHT = theme.BUTTON_HEIGHT - 2              # 34 → 外側36
+UI_BUTTON_PADDING_X = theme.BUTTON_PADDING_X            # 12
 UI_BUTTON_PADDING_Y = 2
-TOOLBAR_BUTTON_SIZE = 32
-TOOLBAR_HEIGHT = 36
+TOOLBAR_BUTTON_SIZE = theme.ICON_BUTTON_SIZE            # 36（= BUTTON_HEIGHT）
+TOOLBAR_ICON_SIZE = QSize(theme.ICON_SIZE, theme.ICON_SIZE)
+# セグメンテッドピルの内側ボタン: グループ枠(1*2) + layout余白(2*2) を引いた高さ
+PILL_SEGMENT_HEIGHT = TOOLBAR_BUTTON_SIZE - 6           # 30
+TOOLBAR_HEIGHT = theme.TOOLBAR_HEIGHT                   # 44
+# BaseModelフィルタの「LoRAなし」哨兵値。実在モデル名と衝突しないよう __ で囲む
+NOLORA_FILTER = "__nolora__"
+# 「サムネイルに画像を指定」で取り込む画像の長辺上限。生成APIの出力（〜1216px）
+# より大きくても表示は最大720pxなので、それより上に作ってもファイルだけ膨らむ。
+THUMBNAIL_ASSIGN_MAX = 1024
+
+# safetensorsヘッダーからBaseModel判定に必要なキーだけを抜き出すパターン。
+# ヘッダー全体を json.loads すると（kohyaが ss_tag_frequency 等を膨大に書き込むため）
+# 3051ファイルで実測9.4s、該当値の正規表現抽出なら実測0.7s。
+LORA_HEADER_PATTERNS: dict[str, re.Pattern[bytes]] = {
+    "new_hash": re.compile(rb'"ss_new_sd_model_hash"\s*:\s*"([^"]*)"'),
+    "old_hash": re.compile(rb'"ss_sd_model_hash"\s*:\s*"([^"]*)"'),
+    "sd_model_name": re.compile(rb'"ss_sd_model_name"\s*:\s*"([^"]*)"'),
+    "architecture": re.compile(rb'"modelspec\.architecture"\s*:\s*"([^"]*)"'),
+    "base_version": re.compile(rb'"ss_base_model_version"\s*:\s*"([^"]*)"'),
+}
+LORA_HEADER_MAX_BYTES = 10 * 1024 * 1024
+# 学習時ベースのハッシュ→BaseModel投票がこの割合以上で一つに固まる場合だけ採用。
+# 実データ例: Illustrious 1668 / Anima 1 → 採用、Illustrious 4 / NoobAI 3 → 却下。
+LORA_HASH_REGISTRY_MIN_RATIO = 0.9
 
 
 def elide(text: str, limit: int) -> str:
@@ -183,6 +213,31 @@ class FolderTreeWidget(QTreeWidget):
         event.acceptProposedAction()
 
 
+class TreeCountDelegate(QStyledItemDelegate):
+    """ツリー2列目の件数。右寄せ・一段小さく淡い色で、行の主役を名前に置く（仕様②）。
+
+    QSS の ::item color は ForegroundRole より優先されるため、色は描画側で確定させる。
+    背景（選択/ホバー）はスタイルに描かせて他列と揃える。
+    """
+
+    def paint(self, painter, option, index):  # noqa: D102
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        text = opt.text
+        bare = QStyleOptionViewItem(opt)
+        bare.text = ""
+        opt.widget.style().drawControl(QStyle.CE_ItemViewItem, bare, painter, opt.widget)
+        painter.save()
+        font = QFont(opt.font)
+        font.setPointSizeF((theme.SMALL_SIZE + 1) * 0.75)
+        painter.setFont(font)
+        selected = bool(opt.state & QStyle.State_Selected)
+        painter.setPen(QColor(theme.TEXT if selected else theme.TEXT_MUTED))
+        rect = opt.rect.adjusted(0, 0, -theme.SPACE_SM, 0)
+        painter.drawText(rect, Qt.AlignRight | Qt.AlignVCenter, text)
+        painter.restore()
+
+
 class RandomGenerationDialog(QDialog):
     def __init__(
         self,
@@ -199,57 +254,18 @@ class RandomGenerationDialog(QDialog):
         self.api = api
         self.preset_prompt_text = preset_prompt_text.strip()
         self.setWindowTitle("ランダム生成")
-        self.setStyleSheet(
-            f"""
-            QDialog {{
-                background: #0f1216;
-                color: #edf2f7;
-            }}
-            QLabel {{
-                color: #edf2f7;
-            }}
+        # 外観は app.setStyleSheet(theme.app_style()) の基底に任せる。
+        # ここで QDialog/QPushButton の一括指定を残すと、基底の部品スタイル
+        # （Secondaryボタン・入力欄・グループボックス）が全部上書きされて消える。
+        self.setStyleSheet(f"""
             QGroupBox {{
-                border: 1px solid #2a3440;
-                border-radius: {UI_RADIUS}px;
-                margin-top: {UI_CARD_MARGIN_TOP}px;
                 padding: 6px 0px 10px 0px;
-                color: #edf2f7;
-                font-weight: 600;
             }}
             QGroupBox::title {{
-                subcontrol-origin: margin;
                 left: {UI_CARD_MARGIN_X}px;
-                padding: 0 4px;
+                padding: 0 {theme.SPACE_SM}px;
             }}
-            QLineEdit, QTextEdit, QPlainTextEdit, QListWidget, QTreeWidget, QListView, QComboBox, QSpinBox {{
-                background: #161b22;
-                border: 1px solid #2a3440;
-                border-radius: {UI_RADIUS}px;
-                color: #edf2f7;
-                padding: 6px 10px;
-                min-height: {UI_CONTROL_HEIGHT}px;
-            }}
-            QPushButton {{
-                background: #2e5fb8;
-                border: 1px solid #2e5fb8;
-                border-radius: {UI_RADIUS}px;
-                color: white;
-                padding: 0px {UI_BUTTON_PADDING_X}px;
-                min-height: {UI_BUTTON_HEIGHT}px;
-                max-height: {UI_BUTTON_HEIGHT}px;
-                height: {UI_BUTTON_HEIGHT}px;
-                font-size: 11px;
-            }}
-            QPushButton:hover {{
-                background: #3a71c6;
-                border-color: #3a71c6;
-            }}
-            QPushButton:pressed {{
-                background: #1e4a9a;
-                border-color: #1e4a9a;
-            }}
-            """
-        )
+        """)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(UI_OUTER_MARGIN, UI_OUTER_MARGIN, UI_OUTER_MARGIN, UI_OUTER_MARGIN)
@@ -258,7 +274,7 @@ class RandomGenerationDialog(QDialog):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        scroll.setStyleSheet(theme.scroll_area())
         layout.addWidget(scroll, 3)
 
         content = QWidget()
@@ -271,7 +287,7 @@ class RandomGenerationDialog(QDialog):
             "毎回 1 件の wildcard を抽選して、固定プロンプトと固定キャラクターに合成して生成します。"
         )
         overview.setWordWrap(True)
-        overview.setStyleSheet("color: #c8d2dd; padding: 2px 4px;")
+        overview.setStyleSheet(f"QLabel {{ {theme.note()} background: transparent; padding: 2px 4px; }}")
         content_layout.addWidget(overview)
 
         source_box = QGroupBox("抽選元")
@@ -352,20 +368,14 @@ class RandomGenerationDialog(QDialog):
         self.random_checkpoint_name.setCurrentText(settings.random_checkpoint_name)
         self.random_refresh_checkpoints_button = QPushButton("候補更新")
         self.random_refresh_checkpoints_button.clicked.connect(self._refresh_random_checkpoint_list)
-        self.random_refresh_checkpoints_button.setFixedHeight(UI_BUTTON_HEIGHT)
+        self.random_refresh_checkpoints_button.setFixedHeight(theme.BUTTON_HEIGHT)
         self.random_checkpoint_status = QLabel("checkpoint 候補を取得できます")
         self.random_checkpoint_status.setWordWrap(True)
         self.random_checkpoint_status.setMinimumHeight(20)
-        self.random_checkpoint_status.setStyleSheet("color: #e7b65c;")
+        self.random_checkpoint_status.setStyleSheet(f"color: {theme.WARNING};")
         self.random_adetailer_enabled = QCheckBox("ADetailer を使う")
         self.random_adetailer_enabled.setChecked(settings.random_adetailer_enabled)
 
-        for widget in (
-            self.prompt_edit,
-            self.character_text,
-            self.negative_prompt_edit,
-        ):
-            self._style_input(widget)
         for widget in (
             self.random_steps,
             self.random_width,
@@ -460,10 +470,10 @@ class RandomGenerationDialog(QDialog):
         button_row = QHBoxLayout()
         self.generate_button = QPushButton("生成開始")
         self.generate_button.clicked.connect(self.start_generation)
-        self.generate_button.setFixedHeight(UI_BUTTON_HEIGHT)
+        self.generate_button.setFixedHeight(theme.BUTTON_HEIGHT)
         self.close_button = QPushButton("閉じる")
         self.close_button.clicked.connect(self.reject)
-        self.close_button.setFixedHeight(UI_BUTTON_HEIGHT)
+        self.close_button.setFixedHeight(theme.BUTTON_HEIGHT)
         button_row.addWidget(self.generate_button)
         button_row.addWidget(self.close_button)
         layout.addLayout(button_row)
@@ -599,7 +609,7 @@ class RandomGenerationDialog(QDialog):
             window_height=base_settings.window_height,
             window_maximized=base_settings.window_maximized,
             splitter_sizes=base_settings.splitter_sizes,
-            detail_splitter_sizes=base_settings.detail_splitter_sizes,
+            left_split_sizes=base_settings.left_split_sizes,
             last_folder=base_settings.last_folder,
             sort_mode=base_settings.sort_mode,
             sort_key=base_settings.sort_key,
@@ -632,7 +642,7 @@ class RandomGenerationDialog(QDialog):
         try:
             checkpoints = self.api.list_checkpoints(self.settings)
         except Exception as exc:
-            self.random_checkpoint_status.setStyleSheet("color: #ef8d8d;")
+            self.random_checkpoint_status.setStyleSheet(f"color: {theme.DANGER_TEXT};")
             self.random_checkpoint_status.setText(f"候補一覧を取得できません: {exc}")
             return
 
@@ -646,10 +656,10 @@ class RandomGenerationDialog(QDialog):
                 self.random_checkpoint_name.addItem(current)
             self.random_checkpoint_name.setCurrentText(current)
             if checkpoints:
-                self.random_checkpoint_status.setStyleSheet("color: #7fd48e;")
+                self.random_checkpoint_status.setStyleSheet(f"color: {theme.OK};")
                 self.random_checkpoint_status.setText(f"{len(checkpoints)} 件の checkpoint 候補を取得しました")
             else:
-                self.random_checkpoint_status.setStyleSheet("color: #e7b65c;")
+                self.random_checkpoint_status.setStyleSheet(f"color: {theme.WARNING};")
                 self.random_checkpoint_status.setText("checkpoint 候補が見つかりませんでした")
         finally:
             self.random_checkpoint_name.blockSignals(False)
@@ -664,7 +674,7 @@ class RandomGenerationDialog(QDialog):
         _setup_japanese_context_menu(line_edit)
         button = QPushButton("参照")
         button.setFixedWidth(72)
-        button.setFixedHeight(UI_BUTTON_HEIGHT)
+        button.setFixedHeight(theme.BUTTON_HEIGHT)
         button.clicked.connect(lambda: self._pick_directory(line_edit))
         layout.addWidget(line_edit)
         layout.addWidget(button)
@@ -675,7 +685,7 @@ class RandomGenerationDialog(QDialog):
         label = QLabel(text)
         label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         label.setMinimumWidth(92)
-        label.setStyleSheet("color: #dce5ef; font-weight: 600;")
+        label.setStyleSheet(f"color: {theme.TEXT}; font-weight: 600;")
         return label
 
     def _stabilize_random_dialog_layout(self, content: QWidget, scroll: QScrollArea, boxes: list[QGroupBox]) -> None:
@@ -704,128 +714,13 @@ class RandomGenerationDialog(QDialog):
         if selected:
             line_edit.setText(selected)
 
-    def _style_line_field(self, widget: QLineEdit) -> None:
-        widget.setMinimumHeight(UI_CONTROL_HEIGHT)
-        widget.setStyleSheet(
-            """
-            QLineEdit {
-                background: #1a1d22;
-                border: 1px solid #2d3640;
-                border-radius: 10px;
-                color: #eef2f7;
-                padding: 6px 10px;
-                font-size: 13px;
-            }
-            """
-        )
-
+    # 入力部品の配色・角丸・境界は theme.app_style() の基底に一本化した。
+    # ここでは高さの指定だけを持つ（旧: #1a1d22/#2d3640 の重複定義を削除）。
     def _style_compact_line_field(self, widget: QLineEdit) -> None:
-        widget.setMinimumHeight(30)
-        widget.setMaximumHeight(30)
-        widget.setStyleSheet(
-            """
-            QLineEdit {
-                background: #1a1d22;
-                border: 1px solid #2d3640;
-                border-radius: 8px;
-                color: #eef2f7;
-                padding: 3px 8px;
-                font-size: 12px;
-                min-height: 30px;
-                max-height: 30px;
-            }
-            """
-        )
-
-    def _style_text_field(self, widget: QPlainTextEdit) -> None:
-        widget.setMinimumHeight(84)
-        widget.setStyleSheet(
-            """
-            QPlainTextEdit {
-                background: #1a1d22;
-                border: 1px solid #2d3640;
-                border-radius: 10px;
-                color: #eef2f7;
-                padding: 8px 10px;
-                font-size: 13px;
-            }
-            """
-        )
+        widget.setFixedHeight(theme.INPUT_HEIGHT - 4)
 
     def _style_compact_combo_field(self, widget: QComboBox) -> None:
-        widget.setMinimumHeight(30)
-        widget.setMaximumHeight(30)
-        widget.setStyleSheet(
-            """
-            QComboBox {
-                background: #1a1d22;
-                border: 1px solid #2d3640;
-                border-radius: 8px;
-                color: #eef2f7;
-                padding: 2px 8px;
-                font-size: 12px;
-                min-height: 30px;
-                max-height: 30px;
-            }
-            QComboBox::drop-down {
-                border: none;
-                width: 20px;
-            }
-            QComboBox QAbstractItemView {
-                background: #1a1d22;
-                color: #eef2f7;
-                selection-background-color: #2b6cb0;
-            }
-            """
-        )
-
-    def _style_combo_field(self, widget: QComboBox) -> None:
-        widget.setMinimumHeight(UI_CONTROL_HEIGHT)
-        widget.setStyleSheet(
-            """
-            QComboBox {
-                background: #1a1d22;
-                border: 1px solid #2d3640;
-                border-radius: 10px;
-                color: #eef2f7;
-                padding: 4px 10px;
-                font-size: 13px;
-            }
-            QComboBox::drop-down {
-                border: none;
-                width: 24px;
-            }
-            QComboBox QAbstractItemView {
-                background: #1a1d22;
-                color: #eef2f7;
-                selection-background-color: #2b6cb0;
-            }
-            """
-        )
-
-    @staticmethod
-    def _style_input(widget: QWidget) -> None:
-        widget.setStyleSheet(
-            """
-            QLineEdit, QTextEdit, QPlainTextEdit, QComboBox {
-                background: #1a1d22;
-                border: 1px solid #2d3640;
-                border-radius: 10px;
-                color: #eef2f7;
-                padding: 8px 10px;
-                font-size: 13px;
-            }
-            QComboBox::drop-down {
-                border: none;
-                width: 20px;
-            }
-            QComboBox QAbstractItemView {
-                background: #1a1d22;
-                color: #eef2f7;
-                selection-background-color: #2b6cb0;
-            }
-            """
-        )
+        widget.setFixedHeight(theme.INPUT_HEIGHT - 4)
 
 
 class ImportOptionsDialog(QDialog):
@@ -846,7 +741,7 @@ class ImportOptionsDialog(QDialog):
 
         help_label = QLabel("Choose how to handle conflicts when a file already exists. This applies to both txt and thumbnail files.")
         help_label.setWordWrap(True)
-        help_label.setStyleSheet("color: #aeb8c2;")
+        help_label.setStyleSheet(theme.note())
         layout.addWidget(help_label)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -861,6 +756,9 @@ class ImportOptionsDialog(QDialog):
 
 class MainWindow(QMainWindow):
     _api_lamp_signal = Signal(str)
+    # ループ外スレッドのベースモデルスキャン完了をメインスレッドに返す。
+    # スキャン本体はディスクI/Oだけを行い、Qtオブジェクトには触れない。
+    lora_base_scan_done = Signal(object)
 
     def __init__(self, app_dir: Path):
         super().__init__()
@@ -911,12 +809,19 @@ class MainWindow(QMainWindow):
         self.folder_children_map: dict[str, set[str]] = {}
         self.fav_folder_children_map: dict[str, set[str]] = {}
         self._folder_tree_populating = False
+        self._folder_counts: dict[str, int] = {}
         # お気に入り機能: お気に入りエントリの abs_path を保持するセット
         self.favorites_file = app_dir / "favorites.json"
         self.favorite_paths: set[str] = self._load_favorites()
         # LoRA名(lower) → BaseModel のマップ（cm-info.json由来）。
         # ill/aniバッジ描画とモデルフィルタの判定に使う。
         self._lora_base_model_map: dict[str, str] = {}
+        # ワイルドカードから参照されているのにディスクに痕跡が無いLoRA名（lower）。
+        # この名前を1つでも参照するカードは LOST 表示（減光＋ピル）になる。
+        self._lost_lora_names: set[str] = set()
+        # ベースモデルスキャンの多重起動ガード（ワーカースレッド実行中フラグ）
+        self._lora_base_scan_running = False
+        self.lora_base_scan_done.connect(self._apply_lora_base_model_result)
         self._startup_load_requested = False
         # rescan_library の完了コールバックで参照されるため、
         # 初期化前に _on_rescan_finished が発火しても AttributeError に
@@ -952,6 +857,8 @@ class MainWindow(QMainWindow):
         self.list_model.set_thumbnail_size(self.settings.thumbnail_size)
         self.list_model.favorite_paths = self.favorite_paths  # お気に入り参照を共有
         self.list_model.lora_base_model_map = self._lora_base_model_map  # ill/aniバッジ参照を共有
+        self.list_model.lost_lora_names = self._lost_lora_names  # LOST表示参照を共有
+        self._sync_gallery_source()
         self.item_delegate = ThumbnailCardDelegate(self)
 
         self.setWindowTitle("Wildcard Manager")
@@ -961,223 +868,247 @@ class MainWindow(QMainWindow):
         self._create_actions()
 
     def _build_ui(self) -> None:
+        # 色・入力欄・ボタン・メニュー・スクロールバーの基底は app.setStyleSheet(theme.app_style())。
+        # ここで基底を再宣言するとウィンドウのシートが app のシートより優先されて
+        # 部品 styles が消えるので、差分だけ持つ。
         self.setStyleSheet(
             f"""
-            QMainWindow, QWidget {{
-                background: #0f1216;
-                color: #edf2f7;
+            QMainWindow {{ background: {theme.APP_BG}; }}
+            QWidget#topControls {{
+                background: {theme.PANEL_SIDE};
+                border: 1px solid {theme.BORDER};
+                border-radius: {theme.RADIUS_PANEL}px;
             }}
-            QLineEdit, QTextEdit, QPlainTextEdit, QListWidget, QTreeWidget, QListView, QComboBox, QSpinBox {{
-                background: #161b22;
-                border: 1px solid #2a3440;
-                border-radius: {UI_RADIUS}px;
-                color: #edf2f7;
-                padding: 6px 10px;
-            }}
-            QWidget#topControls QLineEdit,
-            QWidget#topControls QComboBox {{
-                min-height: {TOOLBAR_BUTTON_SIZE}px;
-                max-height: {TOOLBAR_BUTTON_SIZE}px;
-                height: {TOOLBAR_BUTTON_SIZE}px;
-                padding: 0px 6px;
-                border-radius: 4px;
-                font-size: 11px;
-            }}
-            QWidget#topControls QPushButton {{
-                min-height: {TOOLBAR_BUTTON_SIZE}px;
-                max-height: {TOOLBAR_BUTTON_SIZE}px;
-                height: {TOOLBAR_BUTTON_SIZE}px;
-                padding: 0px;
-                border-radius: 4px;
-                font-size: 14px;
-            }}
-            QListView {{
+            /* カードは delegate が自前描画する。Qt標準の選択背景/ホバーを重ねると二重に光る */
+            QListView#cardView {{
+                background: {theme.APP_BG};
+                border: none;
                 outline: 0;
                 selection-background-color: transparent;
-                selection-color: #edf2f7;
+                selection-color: {theme.TEXT};
             }}
-            QListView::item:selected,
-            QListView::item:selected:active,
-            QListWidget::item:selected,
-            QListWidget::item:selected:active,
-            QTreeWidget::item:selected,
-            QTreeWidget::item:selected:active {{
+            QListView#cardView::item:selected,
+            QListView#cardView::item:selected:active,
+            QListView#cardView::item:hover {{
                 background: transparent;
-                color: #edf2f7;
+                color: {theme.TEXT};
             }}
-            QPushButton {{
-                background: #2e5fb8;
-                border: 1px solid #2e5fb8;
-                border-radius: {UI_RADIUS}px;
-                padding: 0px {UI_BUTTON_PADDING_X}px;
-                min-height: {UI_BUTTON_HEIGHT}px;
-                max-height: {UI_BUTTON_HEIGHT}px;
-                height: {UI_BUTTON_HEIGHT}px;
-                color: white;
+            /* ツリーとリストは標準描画。選択行はアクセントの深い色（仕様②）
+               Qt は別のシートに ::item ルールがあると非該当状態を palette Base（白）で塗る
+               ため、透過でも明示しておくのが安全（実測: 指定しないと行全体が白くなった）。 */
+            QListView::item, QListWidget::item, QTreeView::item, QTreeWidget::item {{
+                background: transparent;
+                color: {theme.TEXT};
+                border-radius: {theme.RADIUS_CHIP}px;
+            }}
+            QTreeView::item:selected, QTreeView::item:selected:active,
+            QTreeView::item:selected:!active,
+            QListWidget::item:selected, QListWidget::item:selected:active {{
+                background: {theme.SELECTED};
+                color: {theme.TEXT};
+            }}
+            /* ツリーの選択行は角丸ピルにしない。ピルだとインデント帯（選択背景が
+               塗られる）と枝葉帯（transparent）が縞模様になって「||」マークに見える
+               （ユーザー指摘）。行全体を一枚の帯にして、マークではなく選択と
+               読めるようにする。 */
+            QTreeView#folderTree::item:selected,
+            QTreeView#folderTree::item:selected:active,
+            QTreeView#folderTree::item:selected:!active {{
+                border-radius: 0;
+            }}
+            QTreeView::branch {{ background: transparent; }}
+            QTreeView::branch:selected, QTreeView::branch:selected:active,
+            QTreeView::branch:selected:!active {{ background: {theme.SELECTED}; }}
+            /* ホバーも行全体で塗る。::item:hover を書くと Qt は枝葉セル
+               （branch）だけ既定の薄い四角を塗り、行本体は無変化になる。
+               インデント帯に浮く小さな灰色箱が「変なハイライト」として
+               見えていた（ユーザー指摘）ので、branch 側と同じ色で揃える。 */
+            QTreeView#folderTree::item:hover {{
+                background: {theme.HOVER_BG};
+                border-radius: 0;
+            }}
+            QTreeView::branch:hover {{ background: {theme.HOVER_BG}; }}
+            /* 選択行の上でホバーしても選択色を維持する（薄めて選別不能にしない） */
+            QTreeView#folderTree::item:selected:hover,
+            QTreeView#folderTree::item:selected:hover:active {{
+                background: {theme.SELECTED};
+            }}
+            /* 行の高さだけ名指しで指定（カード一覧の QListView::item に触れないよう
+               objectName で絞る。高さ未指定のプロパティは上の ::item ルールが生き続ける） */
+            QTreeView#folderTree::item, QListWidget#loraCloud::item {{
+                height: {theme.LIST_ROW_HEIGHT}px;
+            }}
+            QHeaderView::section {{
+                background: transparent;
+                color: {theme.TEXT_MUTED};
+                font-size: {theme.HEADING_SIZE}px;
                 font-weight: 600;
-                font-size: 11px;
-            }}
-            QPushButton:hover {{
-                background: #3a71c6;
-                border-color: #3a71c6;
-            }}
-            QPushButton:pressed {{
-                background: #1e4a9a;
-                border-color: #1e4a9a;
-            }}
-            QMenuBar {{
-                background: #11151b;
-                color: #dbe4ee;
-                spacing: 2px;
-                padding: 4px 8px;
-            }}
-            QMenuBar::item {{
-                background: transparent;
-                padding: 4px 10px;
-                margin: 0px 1px;
-                border-radius: 6px;
-            }}
-            QMenuBar::item:selected {{
-                background: #1d2630;
-            }}
-            QMenu {{
-                background: #151a21;
-                color: #edf2f7;
-                border: 1px solid #2a3440;
-                padding: 6px;
-            }}
-            QMenu::item {{
-                padding: 6px 28px 6px 20px;
-                border-radius: 6px;
-            }}
-            QMenu::item:selected {{
-                background: #2e5fb8;
-            }}
-            QStatusBar {{
-                background: #101419;
-                color: #aeb8c2;
-                border-top: 1px solid #202833;
-            }}
-            QToolBar {{
-                background: #101419;
-                border-bottom: 1px solid #202833;
-                spacing: {UI_SECTION_SPACING}px;
-            }}
-            QToolBar QToolButton {{
-                background: #161b22;
-                border: 1px solid #2a3440;
-                border-radius: {UI_RADIUS}px;
-                padding: 0px {UI_BUTTON_PADDING_X}px;
-                min-height: {UI_BUTTON_HEIGHT}px;
-                max-height: {UI_BUTTON_HEIGHT}px;
-                height: {UI_BUTTON_HEIGHT}px;
-                color: #edf2f7;
-                font-size: 11px;
-            }}
-            QToolBar QToolButton:hover {{
-                background: #1f2731;
+                border: none;
+                padding: {theme.SPACE_SM}px {theme.SPACE}px;
             }}
             """
         )
 
         root = QWidget()
         root_layout = QVBoxLayout(root)
-        root_layout.setContentsMargins(UI_OUTER_MARGIN, UI_OUTER_MARGIN, UI_OUTER_MARGIN, UI_OUTER_MARGIN)
+        # メニューバーとツールバーの間の隙間だけ詰める（左右下は据え置き）
+        root_layout.setContentsMargins(UI_OUTER_MARGIN, 4, UI_OUTER_MARGIN, UI_OUTER_MARGIN)
         root_layout.setSpacing(UI_SECTION_SPACING)
 
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("検索: ファイル名 / 本文 / カスタムタグ / lora:名前")
         self.search_edit.setClearButtonEnabled(True)
         self.search_edit.setMinimumWidth(200)
+        self.search_edit.setMaximumWidth(640)
         self.search_edit.setFixedHeight(TOOLBAR_BUTTON_SIZE)
+        # ツールバー行の高さに揃える（基底の入力欄は36pxなので here で差し替える）
+        self.search_edit.setStyleSheet(theme.input_field(content_height=UI_BUTTON_HEIGHT))
         self.search_edit.textChanged.connect(self.schedule_apply_filters)
 
-        self.result_count_label = QLabel("0 件")
-        self.result_count_label.setAlignment(Qt.AlignCenter)
-        self.result_count_label.setFixedSize(60, TOOLBAR_BUTTON_SIZE)
-        self.result_count_label.setStyleSheet("background: #161b22; border: 1px solid #2a3440; border-radius: 4px; color: #edf2f7; font-size: 11px;")
-
-        self.thumbnail_size_decrease_button = QPushButton("-")
-        self.thumbnail_size_decrease_button.setFixedSize(TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE)
-        self.thumbnail_size_decrease_button.clicked.connect(lambda: self._step_thumbnail_size(-THUMBNAIL_SIZE_STEP))
+        self.thumbnail_size_slider = QSlider(Qt.Horizontal)
+        self.thumbnail_size_slider.setRange(THUMBNAIL_SIZE_MIN, THUMBNAIL_SIZE_MAX)
+        self.thumbnail_size_slider.setSingleStep(THUMBNAIL_SIZE_STEP)
+        self.thumbnail_size_slider.setPageStep(THUMBNAIL_SIZE_STEP * 4)
+        self.thumbnail_size_slider.setTickPosition(QSlider.NoTicks)
+        self.thumbnail_size_slider.setValue(self.settings.thumbnail_size)
+        self.thumbnail_size_slider.setFixedHeight(theme.CHIP_HEIGHT)
+        self.thumbnail_size_slider.setMinimumWidth(140)
+        self.thumbnail_size_slider.setMaximumWidth(220)
+        self.thumbnail_size_slider.setToolTip("サムネイルサイズ　（Ctrl+- / Ctrl+= でも調整可）")
+        self.thumbnail_size_slider.setStyleSheet(theme.slider())
+        # ドラッグ中は毎ピクセル再レイアウトになると重いので、止まってから適用する
+        self._size_apply_timer = QTimer(self)
+        self._size_apply_timer.setSingleShot(True)
+        self._size_apply_timer.setInterval(90)
+        self._size_apply_timer.timeout.connect(
+            lambda: self._set_thumbnail_size(self.thumbnail_size_slider.value()))
+        self.thumbnail_size_slider.valueChanged.connect(self._on_thumbnail_size_slid)
         self.thumbnail_size_display = QLabel()
         self.thumbnail_size_display.setAlignment(Qt.AlignCenter)
-        self.thumbnail_size_display.setFixedSize(56, TOOLBAR_BUTTON_SIZE)
-        self.thumbnail_size_display.setStyleSheet("background: #161b22; border: 1px solid #2a3440; border-radius: 4px; color: #edf2f7; font-size: 11px;")
+        self.thumbnail_size_display.setFixedSize(56, theme.CHIP_HEIGHT)
+        self.thumbnail_size_display.setStyleSheet(f"QLabel {{ {theme.chip()} }}")
         self._update_thumbnail_size_display(self.settings.thumbnail_size)
-        self.thumbnail_size_increase_button = QPushButton("+")
-        self.thumbnail_size_increase_button.setFixedSize(TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE)
-        self.thumbnail_size_increase_button.clicked.connect(lambda: self._step_thumbnail_size(THUMBNAIL_SIZE_STEP))
 
         self.size_group = QWidget()
-        self.size_group.setFixedHeight(TOOLBAR_BUTTON_SIZE)
+        self.size_group.setFixedHeight(theme.CHIP_HEIGHT + 4)
         size_layout = QHBoxLayout(self.size_group)
         size_layout.setContentsMargins(0, 0, 0, 0)
-        size_layout.setSpacing(2)
-        size_layout.addWidget(self.thumbnail_size_decrease_button)
+        size_layout.setSpacing(theme.GAP_PAIR)
+        # ステータスバーがこの群を引き伸ばすと、バーと数値表示の間に隙間が
+        # 生まれて「別々の部品」に見える。先頭ストレッチで群を右に固める。
+        size_layout.addStretch(1)
+        size_layout.addWidget(self.thumbnail_size_slider)
         size_layout.addWidget(self.thumbnail_size_display)
-        size_layout.addWidget(self.thumbnail_size_increase_button)
 
-        dark_button_style = """
-            QPushButton {
-                background: #1a1d22;
-                border: 1px solid #2a3440;
-                border-radius: 4px;
-                color: #edf2f7;
-                font-size: 14px;
-                padding: 0px;
-                min-height: %dpx;
-                max-height: %dpx;
-                height: %dpx;
-            }
-            QPushButton:hover {
-                background: #2a2d32;
-                border-color: #3a4450;
-            }
-            QPushButton:pressed {
-                background: #14171c;
-                border-color: #1e2430;
-            }
-        """ % (TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE)
+        # ツールバーのボタン階層（仕様①）: Primary=新規作成 / Secondary=ランダム /
+        # Ghost=ペイン開閉・設定。行の高さ 34 に揃えるため content_height を明示する。
+        primary_button_style = theme.button("primary", content_height=UI_BUTTON_HEIGHT)
+        secondary_button_style = theme.button("secondary", content_height=UI_BUTTON_HEIGHT)
+        ghost_button_style = theme.icon_button(content_height=UI_BUTTON_HEIGHT)
 
-        self.folder_tree_button = QPushButton("📁")
-        self.folder_tree_button.setFixedSize(TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE)
-        self.folder_tree_button.setToolTip("フォルダツリー")
+        # 2つのペイン開閉を1つの塊にまとめ、開いている側だけをハイライトする
+        # （checkable で状態を表す）。接合部は1つの塊として読めるよう仕切り線だけ入れる。
+        self.pane_tab_group = QWidget()
+        self.pane_tab_group.setObjectName("paneTabGroup")
+        # 高さはグループが持つ。セグメントはレイアウトが内法まで伸ばす
+        # （ここで固定すると塗りだけが浮いてピルに収まらない）。
+        self.pane_tab_group.setFixedHeight(TOOLBAR_BUTTON_SIZE)
+        pane_tab_layout = QHBoxLayout(self.pane_tab_group)
+        pane_tab_layout.setContentsMargins(2, 2, 2, 2)
+        pane_tab_layout.setSpacing(0)
+        pane_tab_style = f"""
+            QWidget#paneTabGroup {{
+                background: {theme.PANEL_MAIN};
+                border: 1px solid {theme.BORDER};
+                border-radius: {theme.RADIUS_CONTROL}px;
+            }}
+            QPushButton {{
+                background: transparent;
+                border: none;
+                color: {theme.TEXT_MUTED};
+                font-size: {theme.FONT_SIZE}px;
+                padding: 0px {theme.BUTTON_PADDING_X}px;
+                min-height: {PILL_SEGMENT_HEIGHT}px;
+                max-height: {PILL_SEGMENT_HEIGHT}px;
+            }}
+            QPushButton#folderTab {{
+                border-top-left-radius: {theme.RADIUS_CHIP}px;
+                border-bottom-left-radius: {theme.RADIUS_CHIP}px;
+            }}
+            QPushButton#loraTab {{
+                border-left: 1px solid {theme.BORDER};
+                border-top-right-radius: {theme.RADIUS_CHIP}px;
+                border-bottom-right-radius: {theme.RADIUS_CHIP}px;
+            }}
+            QPushButton:hover {{ color: {theme.TEXT}; background: {theme.GHOST_HOVER}; }}
+            QPushButton:checked {{
+                background: {theme.SELECTED};
+                color: {theme.TEXT};
+            }}
+        """
+
+        self.folder_tree_button = QPushButton("フォルダ")
+        self.folder_tree_button.setObjectName("folderTab")
+        self.folder_tree_button.setIcon(icon_folder(text_gap=True))
+        self.folder_tree_button.setIconSize(icon_text_size())
+        self.folder_tree_button.setCheckable(True)
+        self.folder_tree_button.setToolTip("フォルダ一覧を開く/閉じる")
         self.folder_tree_button.clicked.connect(self._switch_to_folder_tab)
-        self.folder_tree_button.setStyleSheet(dark_button_style)
+        self.folder_tree_button.setStyleSheet(pane_tab_style)
+        pane_tab_layout.addWidget(self.folder_tree_button)
 
-        self.lora_button = QPushButton("🔗")
-        self.lora_button.setFixedSize(TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE)
-        self.lora_button.setToolTip("LoRA一覧")
+        self.lora_button = QPushButton("LoRA")
+        self.lora_button.setObjectName("loraTab")
+        self.lora_button.setIcon(icon_lora(text_gap=True))
+        self.lora_button.setIconSize(icon_text_size())
+        self.lora_button.setCheckable(True)
+        self.lora_button.setToolTip("LoRA一覧（使用回数）を開く/閉じる")
         self.lora_button.clicked.connect(self._switch_to_lora_tab)
-        self.lora_button.setStyleSheet(dark_button_style)
+        self.lora_button.setStyleSheet(pane_tab_style)
+        pane_tab_layout.addWidget(self.lora_button)
 
-        self.left_toggle_button = QPushButton("◀")
+        # パネル開閉は「向き」の矢印ではなく、帯の位置でどちらのパネルか示す
+        # sidebarアイコン（VS Code / Figma系）。塗り=表示中、点線枠=隠れている。
+        self.left_toggle_button = QPushButton()
+        self.left_toggle_button.setIcon(icon_panel("left", True))
+        self.left_toggle_button.setIconSize(TOOLBAR_ICON_SIZE)
         self.left_toggle_button.setFixedSize(TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE)
-        self.left_toggle_button.setToolTip("左パネルを表示/非表示")
         self.left_toggle_button.clicked.connect(self.toggle_left_panel)
-        self.left_toggle_button.setStyleSheet(dark_button_style)
+        self.left_toggle_button.setStyleSheet(ghost_button_style)
 
-        self.right_toggle_button = QPushButton("▶")
+        self.right_toggle_button = QPushButton()
+        self.right_toggle_button.setIcon(icon_panel("right", True))
+        self.right_toggle_button.setIconSize(TOOLBAR_ICON_SIZE)
         self.right_toggle_button.setFixedSize(TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE)
-        self.right_toggle_button.setToolTip("右パネルを表示/非表示")
         self.right_toggle_button.clicked.connect(self.toggle_right_panel)
-        self.right_toggle_button.setStyleSheet(dark_button_style)
+        self.right_toggle_button.setStyleSheet(ghost_button_style)
 
-        self.new_wildcard_button = QPushButton("📝 新規作成")
+        self.new_wildcard_button = QPushButton("ワイルドカード新規作成")
+        self.new_wildcard_button.setIcon(icon_new_card(text_gap=True))
+        self.new_wildcard_button.setIconSize(icon_text_size())
         self.new_wildcard_button.setFixedHeight(TOOLBAR_BUTTON_SIZE)
-        self.new_wildcard_button.setMinimumWidth(80)
         self.new_wildcard_button.setToolTip("ワイルドカード新規作成 (Ctrl+N)")
         self.new_wildcard_button.clicked.connect(lambda checked=False: self.create_wildcard())
-        self.new_wildcard_button.setStyleSheet(dark_button_style)
+        self.new_wildcard_button.setStyleSheet(primary_button_style)
 
-        self.random_generation_button = QPushButton("🎲")
-        self.random_generation_button.setFixedSize(TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE)
+        self.random_generation_button = QPushButton("ランダム生成")
+        self.random_generation_button.setIcon(icon_random(text_gap=True))
+        self.random_generation_button.setIconSize(icon_text_size())
+        self.random_generation_button.setFixedHeight(TOOLBAR_BUTTON_SIZE)
         self.random_generation_button.setToolTip("ランダム生成")
         self.random_generation_button.clicked.connect(lambda checked=False: self.open_random_generation())
-        self.random_generation_button.setStyleSheet(dark_button_style)
+        self.random_generation_button.setStyleSheet(secondary_button_style)
+
+        self.settings_button = QPushButton()
+        self.settings_button.setIcon(icon_settings())
+        self.settings_button.setIconSize(TOOLBAR_ICON_SIZE)
+        self.settings_button.setFixedSize(TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE)
+        self.settings_button.setToolTip("設定 (Ctrl+,)")
+        self.settings_button.clicked.connect(lambda checked=False: self.open_settings())
+        self.settings_button.setStyleSheet(ghost_button_style)
 
         self.api_lamp = ApiStatusIndicator()
+        self.api_lamp.setFixedHeight(TOOLBAR_BUTTON_SIZE)
         self.api_lamp.setToolTip("API: 切断")
 
         self._api_lamp_signal.connect(self.api_lamp.set_state)
@@ -1185,30 +1116,32 @@ class MainWindow(QMainWindow):
         self._api_monitor = ApiMonitorWorker(self.api, lambda: self.settings, self)
         self._api_monitor.state_changed.connect(self._api_lamp_signal.emit)
 
-        self.thumbnail_size_decrease_button.setStyleSheet(dark_button_style)
-        self.thumbnail_size_increase_button.setStyleSheet(dark_button_style)
-
         self.top_controls = QWidget()
         self.top_controls.setObjectName("topControls")
         self.top_controls.setFixedHeight(TOOLBAR_HEIGHT)
         self.top_controls.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         toolbar_layout = QHBoxLayout(self.top_controls)
         toolbar_layout.setContentsMargins(4, 2, 4, 2)
-        toolbar_layout.setSpacing(4)
-        toolbar_layout.addWidget(self.folder_tree_button)
-        toolbar_layout.addWidget(self.lora_button)
-        toolbar_layout.addSpacing(8)
+        # 間隔は2段組: 同じ役割のペアは GAP_PAIR、役割の違う塊の間は GAP_CLUSTER。
+        # addSpacing は基底 spacing に足されるので、差分だけたす。
+        toolbar_layout.setSpacing(theme.GAP_PAIR)
+        cluster_gap = theme.GAP_CLUSTER - theme.GAP_PAIR
+        # 左=ペイン開閉、中央=検索、右=作成系 → 状態 → パネル開閉 → 設定。
+        # サムネイルサイズはステータスバー右へ移したので、ここでは幅を使わない。
+        toolbar_layout.addWidget(self.pane_tab_group)
+        toolbar_layout.addSpacing(cluster_gap)
         toolbar_layout.addWidget(self.search_edit, 1)
-        toolbar_layout.addSpacing(8)
-        toolbar_layout.addWidget(self.result_count_label)
-        toolbar_layout.addWidget(self.size_group)
-        toolbar_layout.addWidget(self.new_wildcard_button)
+        toolbar_layout.addStretch(1)
+        toolbar_layout.addSpacing(cluster_gap)
         toolbar_layout.addWidget(self.random_generation_button)
-        toolbar_layout.addSpacing(8)
+        toolbar_layout.addWidget(self.new_wildcard_button)
+        toolbar_layout.addSpacing(cluster_gap)
         toolbar_layout.addWidget(self.api_lamp)
-        toolbar_layout.addSpacing(8)
+        toolbar_layout.addSpacing(cluster_gap)
         toolbar_layout.addWidget(self.left_toggle_button)
         toolbar_layout.addWidget(self.right_toggle_button)
+        toolbar_layout.addSpacing(cluster_gap)
+        toolbar_layout.addWidget(self.settings_button)
         root_layout.addWidget(self.top_controls)
         self._update_top_controls_layout()
 
@@ -1217,7 +1150,19 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(self.splitter, 1)
 
         self.folder_tree = FolderTreeWidget()
-        self.folder_tree.setHeaderLabel("フォルダ")
+        self.folder_tree.setObjectName("folderTree")
+        # 0列=名前 / 1列=件数（右寄せ）。仕様②「各フォルダの件数を右寄せ」
+        self.folder_tree.setColumnCount(2)
+        self.folder_tree.setHeaderLabels(["フォルダ", ""])
+        self.folder_tree.setIconSize(QSize(theme.ICON_SIZE, theme.ICON_SIZE))
+        tree_header = self.folder_tree.header()
+        tree_header.setStretchLastSection(False)
+        tree_header.setHighlightSections(False)
+        tree_header.setSectionsClickable(False)
+        tree_header.setSectionResizeMode(0, QHeaderView.Stretch)
+        tree_header.setSectionResizeMode(1, QHeaderView.Fixed)
+        self.folder_tree.setColumnWidth(1, 46)
+        self.folder_tree.setItemDelegateForColumn(1, TreeCountDelegate(self.folder_tree))
         self.folder_tree.itemSelectionChanged.connect(self._on_folder_changed)
         self.folder_tree.itemExpanded.connect(self._on_folder_item_expanded)
         self.folder_tree.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -1238,6 +1183,10 @@ class MainWindow(QMainWindow):
         left_layout = QVBoxLayout(self.left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(0)
+        # フォルダツリーとLoRAフィルタの縦配分はドラッグで調整し、ui_state.jsonに保存する
+        self.left_split = QSplitter(Qt.Vertical)
+        self.left_split.setChildrenCollapsible(False)
+        self.left_split.setHandleWidth(6)
 
         self.folder_tree_container = QWidget()
         folder_container_layout = QVBoxLayout(self.folder_tree_container)
@@ -1250,34 +1199,45 @@ class MainWindow(QMainWindow):
         lora_container_layout = QVBoxLayout(self.lora_container)
         lora_container_layout.setContentsMargins(4, 2, 4, 4)
         lora_container_layout.setSpacing(2)
-        # モデルフィルタ（LoRAフィルタの上に1行）。cm-info.jsonのBaseModelで絞り込む。
-        self.model_filter_combo = NoWheelComboBox()
-        self.model_filter_combo.setToolTip("LoRAのBaseModelで絞り込む")
-        self.model_filter_combo.addItem("モデル: すべて", "")
-        self.model_filter_combo.addItem("illのみ", "illustrious")
-        self.model_filter_combo.addItem("aniのみ", "anima")
-        self.model_filter_combo.addItem("混在", "mix")
-        self.model_filter_combo.addItem("LoRAなし", "nolora")
-        self.model_filter_combo.currentIndexChanged.connect(lambda _idx: self.schedule_apply_filters())
-        lora_container_layout.addWidget(self.model_filter_combo)
         lora_header_layout = QHBoxLayout()
         lora_header_layout.setContentsMargins(0, 0, 0, 0)
-        lora_header_layout.addWidget(QLabel("LoRAフィルタ"))
+        lora_title = QLabel("LoRAフィルタ")
+        lora_title.setStyleSheet(f"QLabel {{ {theme.heading()} }}")
+        lora_header_layout.addWidget(lora_title)
         lora_header_layout.addStretch(1)
-        lora_container_layout.addLayout(lora_header_layout)
         self.lora_deselect_all = QCheckBox("すべて外す")
         self.lora_deselect_all.setChecked(True)
-        self.lora_deselect_all.setStyleSheet("color:#edf2f7;font-size:11px")
+        # ネイティブのチェック印はダークテーマで潰えて見えるため、状態を面で見せる
+        self.lora_deselect_all.setStyleSheet(theme.checkbox())
         self.lora_deselect_all.toggled.connect(self._on_lora_deselect_all)
-        lora_container_layout.addWidget(self.lora_deselect_all)
+        lora_header_layout.addWidget(self.lora_deselect_all)
+        lora_container_layout.addLayout(lora_header_layout)
         self.lora_cloud = QListWidget()
+        self.lora_cloud.setObjectName("loraCloud")
         self.lora_cloud.setContextMenuPolicy(Qt.CustomContextMenu)
         self.lora_cloud.customContextMenuRequested.connect(self._show_lora_cloud_context_menu)
         self.lora_cloud.itemChanged.connect(self._on_lora_item_changed)
         lora_container_layout.addWidget(self.lora_cloud, 1)
 
-        left_layout.addWidget(self.folder_tree_container)
-        left_layout.addWidget(self.lora_container)
+        # BaseModelフィルタはカード一覧にも効く全体フィルタなので、左パネルの最上部（ツリーより上）に置く
+        model_caption = QLabel("BaseModelで絞り込み")
+        model_caption.setStyleSheet(f"QLabel {{ {theme.note()} }}")
+        self.model_filter_combo = NoWheelComboBox()
+        self.model_filter_combo.setToolTip("各LoRAのcm-info.jsonのBaseModelでカード一覧を絞り込む")
+        self.model_filter_combo.currentIndexChanged.connect(lambda _idx: self.schedule_apply_filters())
+        self._repopulate_model_filter_combo()
+        model_filter_block = QWidget()
+        model_filter_layout = QVBoxLayout(model_filter_block)
+        model_filter_layout.setContentsMargins(4, 2, 4, 4)
+        model_filter_layout.setSpacing(2)
+        model_filter_layout.addWidget(model_caption)
+        model_filter_layout.addWidget(self.model_filter_combo)
+
+        left_layout.addWidget(model_filter_block)
+        self.left_split.addWidget(self.folder_tree_container)
+        self.left_split.addWidget(self.lora_container)
+        self.left_split.setSizes(self.settings.left_split_sizes)
+        left_layout.addWidget(self.left_split, 1)
         self.splitter.addWidget(self.left_panel)
 
         center = QWidget()
@@ -1287,6 +1247,7 @@ class MainWindow(QMainWindow):
         center_layout.setSpacing(UI_SECTION_SPACING)
 
         self.card_view = SlowWheelListView(scroll_step=self.settings.scroll_step)
+        self.card_view.setObjectName("cardView")
         self.card_view.setModel(self.list_model)
         self.card_view.setItemDelegate(self.item_delegate)
         self.card_view.setViewMode(QListView.IconMode)
@@ -1322,7 +1283,7 @@ class MainWindow(QMainWindow):
         right_scroll.setWidgetResizable(True)
         right_scroll.setFrameShape(QFrame.NoFrame)
         right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        right_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        right_scroll.setStyleSheet(theme.scroll_area())
         right_layout.addWidget(right_scroll, 1)
 
         right_content = QWidget()
@@ -1338,71 +1299,70 @@ class MainWindow(QMainWindow):
         self.path_label.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
         self.path_label.setIndent(12)
         self.path_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-        self.path_label.setStyleSheet("background: #151a21; border: 1px solid #2a3440; border-radius: 10px; color: #d4dbe3;")
+        self.path_label.setStyleSheet(
+            f"QLabel {{ background: {theme.PANEL_MAIN}; border: 1px solid {theme.BORDER};"
+            f" border-radius: {theme.RADIUS_CONTROL}px; color: {theme.TEXT_MUTED};"
+            f" font-size: {theme.SMALL_SIZE + 1}px; }}"
+        )
         self._path_label_text = "ファイル未選択"
 
         preview_panel = QFrame()
         preview_panel.setObjectName("detailPreviewPanel")
         preview_panel.setMinimumWidth(0)
-        preview_panel.setStyleSheet(
-            "QFrame#detailPreviewPanel {"
-            " background: #131820;"
-            " border: 1px solid #2a3440;"
-            " border-radius: 14px;"
-            "}"
-        )
+        preview_panel.setStyleSheet(theme.panel("detailPreviewPanel", theme.PANEL_SIDE))
         preview_layout = QVBoxLayout(preview_panel)
         preview_layout.setContentsMargins(UI_CARD_PADDING_X, UI_CARD_PADDING_Y, UI_CARD_PADDING_X, UI_CARD_PADDING_Y)
         preview_layout.setSpacing(UI_SECTION_SPACING)
 
         self.thumbnail_label = ResponsivePixmapLabel("サムネイルなし")
         self.thumbnail_label.setAlignment(Qt.AlignCenter)
-        self.thumbnail_label.setMinimumHeight(260)
-        self.thumbnail_label.setMaximumHeight(360)
+        # プレビューを一段小さくし、下段（タグ・元テキスト面板）の縦空間を確保する
+        self.thumbnail_label.setMinimumHeight(320)
+        self.thumbnail_label.setMaximumHeight(440)
         self.thumbnail_label.setMinimumWidth(0)
-        self.thumbnail_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        self.thumbnail_label.setStyleSheet("border: 1px solid #2a3440; border-radius: 14px; background: #0d1014;")
+        self.thumbnail_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.thumbnail_label.setStyleSheet(
+            f"border: 1px solid {theme.BORDER}; border-radius: {theme.RADIUS_CARD}px;"
+            f" background: {theme.APP_BG};"
+        )
         preview_layout.addWidget(self.thumbnail_label)
         preview_layout.addWidget(self.path_label)
 
         preview_layout.addWidget(QLabel("LoRA"))
         self.lora_list = QListWidget()
-        lora_height = self._lora_list_height(4)
-        self.lora_list.setFixedHeight(lora_height)
+        self._apply_lora_list_height(0)
         self.lora_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.lora_list.setMinimumWidth(0)
         self.lora_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.lora_list.customContextMenuRequested.connect(self._show_lora_context_menu)
         preview_layout.addWidget(self.lora_list)
-        right_content_layout.addWidget(preview_panel)
+        right_content_layout.addWidget(preview_panel, 2)
 
         editor_panel = QFrame()
         editor_panel.setObjectName("detailEditorPanel")
         editor_panel.setMinimumWidth(0)
-        editor_panel.setStyleSheet(
-            "QFrame#detailEditorPanel {"
-            " background: #131820;"
-            " border: 1px solid #2a3440;"
-            " border-radius: 14px;"
-            "}"
-        )
+        editor_panel.setStyleSheet(theme.panel("detailEditorPanel", theme.PANEL_SIDE))
         editor_layout = QVBoxLayout(editor_panel)
         editor_layout.setContentsMargins(UI_CARD_PADDING_X, UI_CARD_PADDING_Y, UI_CARD_PADDING_X, UI_CARD_PADDING_Y)
         editor_layout.setSpacing(UI_SECTION_SPACING)
         copy_buttons_row = QHBoxLayout()
-        copy_buttons_row.setSpacing(UI_SECTION_SPACING)
-        self.copy_all_with_lora_button = QPushButton("プロンプトコピー（LORAあり）")
+        # コピー2つは同じ役割のペア。面板のセクション間隔（16）ではなくクラスタ間隔で寄せる
+        copy_buttons_row.setSpacing(theme.GAP_CLUSTER)
+        self.copy_all_with_lora_button = QPushButton("LoRAありでコピー")
+        self.copy_all_with_lora_button.setToolTip("カード本文を <lora:...> タグ付きのままコピー")
         self.copy_all_with_lora_button.clicked.connect(lambda: self.copy_all_text(True))
-        self.copy_all_without_lora_button = QPushButton("プロンプトコピー（LORAなし）")
+        self.copy_all_without_lora_button = QPushButton("LoRAなしでコピー")
+        self.copy_all_without_lora_button.setToolTip("<lora:...> タグだけ抜いてコピー（LoRAを削除しても安全）")
         self.copy_all_without_lora_button.clicked.connect(lambda: self.copy_all_text(False))
         self.copy_all_with_lora_button.setMinimumWidth(0)
         self.copy_all_without_lora_button.setMinimumWidth(0)
         self.copy_all_with_lora_button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.copy_all_without_lora_button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        # 仕様①の階層: 主操作(LoRAあり)=Primary / 副操作=Secondary
+        self.copy_all_with_lora_button.setStyleSheet(theme.button("primary"))
+        self.copy_all_without_lora_button.setStyleSheet(theme.button("secondary"))
         copy_buttons_row.addWidget(self.copy_all_with_lora_button)
         copy_buttons_row.addWidget(self.copy_all_without_lora_button)
-        editor_layout.addLayout(copy_buttons_row)
-        editor_layout.addWidget(QLabel("検索用カスタムタグ"))
         self.custom_tags_edit = TagEditorWidget()
         self.custom_tags_edit.setMinimumWidth(0)
         editor_layout.addWidget(self.custom_tags_edit)
@@ -1411,37 +1371,47 @@ class MainWindow(QMainWindow):
         self.prompt_tags_edit = TagEditorWidget()
         self.prompt_tags_edit.setMinimumWidth(0)
         self.prompt_tags_edit.tagsChanged.connect(self._sync_editor_from_prompt_tags)
+        self.prompt_tags_edit.searchRequested.connect(self._search_by_tag)
+        # コピー成否のトースト。QToolTip はマウス移動で消えて読めないため、
+        # ウィンドウ下部に出る ToastPopup を使う（ユーザー指摘の「短い」対策）
+        self.prompt_tags_edit.tagCopied.connect(lambda t: self.show_toast(f"コピー: {t}", 4000))
         editor_layout.addWidget(self.prompt_tags_edit)
+        # 階層順にコピーはタグの下（読む→使う順）
+        editor_layout.addLayout(copy_buttons_row)
+        right_content_layout.addWidget(editor_panel)
+
+        # 仕様④: 元テキストは独立した面板にし、編集はその面板の右上に置く
+        text_panel = QFrame()
+        text_panel.setObjectName("detailTextPanel")
+        text_panel.setMinimumWidth(0)
+        text_panel.setStyleSheet(theme.panel("detailTextPanel", theme.PANEL_SIDE))
+        text_layout = QVBoxLayout(text_panel)
+        text_layout.setContentsMargins(UI_CARD_PADDING_X, UI_CARD_PADDING_Y, UI_CARD_PADDING_X, UI_CARD_PADDING_Y)
+        text_layout.setSpacing(UI_SECTION_SPACING)
         editor_header_row = QHBoxLayout()
         editor_header_row.setContentsMargins(0, 0, 0, 0)
-        editor_header_row.setSpacing(UI_SECTION_SPACING)
+        editor_header_row.setSpacing(theme.GAP_PAIR)
         editor_header_row.addWidget(QLabel("元テキスト"))
         editor_header_row.addStretch(1)
         self.delete_tags_button = QPushButton("削除")
-        self.delete_tags_button.setFixedHeight(UI_BUTTON_HEIGHT)
-        self.delete_tags_button.setStyleSheet(
-            "QPushButton { background: #6a2a2a; border: 1px solid #8a3a3a; border-radius: 6px;"
-            " color: #ffcccc; font-size: 11px; padding: 0 10px; }"
-            "QPushButton:hover { background: #8a3a3a; }"
-            "QPushButton:pressed { background: #4a1a1a; border-color: #6a2a2a; }"
-            "QPushButton:disabled { background: #3a2a2a; color: #6a5a5a; }"
-        )
+        self.delete_tags_button.setStyleSheet(theme.danger_button(content_height=UI_BUTTON_HEIGHT))
         self.delete_tags_button.setEnabled(False)
         self.delete_tags_button.clicked.connect(self._delete_selected_tags)
         self.delete_tags_button.hide()
         editor_header_row.addWidget(self.delete_tags_button)
         self.edit_button = QPushButton("編集")
+        self.edit_button.setStyleSheet(theme.button("secondary"))
         self.edit_button.clicked.connect(self.toggle_edit_mode)
         editor_header_row.addWidget(self.edit_button)
-        editor_layout.addLayout(editor_header_row)
+        text_layout.addLayout(editor_header_row)
         self.editor = QTextEdit()
         self.editor.setMinimumHeight(80)
         self.editor.setMinimumWidth(0)
         self.editor.setReadOnly(True)
         self.editor.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.editor.textChanged.connect(self._sync_tags_from_editor)
-        editor_layout.addWidget(self.editor, 1)
-        right_content_layout.addWidget(editor_panel)
+        text_layout.addWidget(self.editor, 1)
+        right_content_layout.addWidget(text_panel, 1)
         self.splitter.addWidget(self.right_panel)
 
         self.splitter.setSizes(self._normalized_splitter_sizes(self.settings.splitter_sizes))
@@ -1464,15 +1434,21 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(root)
         status_bar = QStatusBar()
-        status_bar.setStyleSheet("""
-            QStatusBar {
-                background: #101419;
-                color: #aeb8c2;
-                border-top: 1px solid #202833;
-                font-size: 11px;
-            }
+        # 仕様⑤: 左=件数などの情報、右=サムネイルサイズのズーム、高さは抑えて常設バーにする
+        status_bar.setStyleSheet(f"""
+            QStatusBar {{
+                background: {theme.PANEL_SIDE};
+                border-top: 1px solid {theme.BORDER};
+                color: {theme.TEXT_MUTED};
+                font-size: {theme.SMALL_SIZE + 1}px;
+            }}
+            QStatusBar::item {{ border: none; }}
+            QStatusBar QLabel {{ color: {theme.TEXT_MUTED}; background: transparent; }}
         """)
+        status_bar.setFixedHeight(theme.SPACE + theme.CHIP_HEIGHT)
         self.setStatusBar(status_bar)
+        # 参照デザインどおり、サムネイルサイズの操作は下部ステータスバー右に常設する
+        status_bar.addPermanentWidget(self.size_group)
 
         self.card_view.selectionModel().currentChanged.connect(self._on_card_selection_changed)
         self.card_view.selectionModel().selectionChanged.connect(self._update_selection_count)
@@ -1506,8 +1482,8 @@ class MainWindow(QMainWindow):
 
         # Edit menu
         self.action_edit = add_action("編集モード", self.toggle_edit_mode, "Ctrl+E")
-        self.action_copy_with_lora = add_action("プロンプトコピー（LORAあり）", lambda: self.copy_all_text(True), "Ctrl+C")
-        self.action_copy_without_lora = add_action("プロンプトコピー（LORAなし）", lambda: self.copy_all_text(False), "Ctrl+Shift+C")
+        self.action_copy_with_lora = add_action("LoRAありでコピー", lambda: self.copy_all_text(True), "Ctrl+C")
+        self.action_copy_without_lora = add_action("LoRAなしでコピー", lambda: self.copy_all_text(False), "Ctrl+Shift+C")
         self.action_delete_card = add_action("カードを削除", self._delete_selected_cards, "Delete")
 
         # View menu
@@ -1553,6 +1529,9 @@ class MainWindow(QMainWindow):
 
         # Tools menu
         self.action_thumbnail_generate = add_action("サムネイルを生成", self.generate_thumbnail_for_current, "Ctrl+G")
+        self.action_thumbnail_assign = add_action("サムネイルに画像を指定...", self.assign_thumbnail_from_current)
+        self.action_thumbnail_add = add_action("サムネイルに画像を追加...", self.add_thumbnail_from_current)
+        self.action_thumbnail_delete = add_action("表示中のサムネイルを削除...", self.delete_current_thumbnail)
         self.action_thumbnail_missing = add_action("不足サムネイルを一括生成", self.generate_missing_thumbnails)
         self.action_random_generation = add_action("ランダム生成", lambda: self.open_random_generation(), "Ctrl+R")
         self.action_import = add_action("ワイルドカードを取り込み", lambda: self.run_import("copy"), "Ctrl+I")
@@ -1600,6 +1579,9 @@ class MainWindow(QMainWindow):
         tools_menu.addAction(self.action_new_wildcard)
         tools_menu.addSeparator()
         tools_menu.addAction(self.action_thumbnail_generate)
+        tools_menu.addAction(self.action_thumbnail_assign)
+        tools_menu.addAction(self.action_thumbnail_add)
+        tools_menu.addAction(self.action_thumbnail_delete)
         tools_menu.addAction(self.action_thumbnail_missing)
         tools_menu.addSeparator()
         tools_menu.addAction(self.action_random_generation)
@@ -1637,8 +1619,8 @@ class MainWindow(QMainWindow):
         Ctrl+Q - 終了<br><br>
         <b>編集</b><br>
         Ctrl+E - 編集モード<br>
-        Ctrl+C - プロンプトコピー（LORAあり）<br>
-        Ctrl+Shift+C - プロンプトコピー（LORAなし）<br>
+        Ctrl+C - LoRAありでコピー<br>
+        Ctrl+Shift+C - LoRAなしでコピー<br>
         Del - カードを削除<br><br>
         <b>表示</b><br>
         Ctrl+= - サムネイルを大きく<br>
@@ -1662,10 +1644,14 @@ class MainWindow(QMainWindow):
         self.folder_tree.setVisible(not self.folder_tree.isVisible())
 
     def _switch_to_folder_tab(self) -> None:
-        self.folder_tree_container.setVisible(not self.folder_tree_container.isVisible())
+        # isVisible() だとウィンドウ表示前は常にFalseで「閉じる」が効かない。
+        # isHidden()（明示的なhideフラグ）で反転させる。
+        self.folder_tree_container.setVisible(self.folder_tree_container.isHidden())
+        self._update_panel_toggle_buttons()
 
     def _switch_to_lora_tab(self) -> None:
-        self.lora_container.setVisible(not self.lora_container.isVisible())
+        self.lora_container.setVisible(self.lora_container.isHidden())
+        self._update_panel_toggle_buttons()
 
     def _sort_entries(self, entries: list[WildcardEntry]) -> list[WildcardEntry]:
         sort_key = getattr(self.settings, "sort_key", "name")
@@ -1744,46 +1730,59 @@ class MainWindow(QMainWindow):
 
     def _update_thumbnail_size_display(self, value: int) -> None:
         self.thumbnail_size_display.setText(f"{value} px")
+        # キーボード/設定からの変更もスライダーに反映する（valueChangedのループは防止）
+        slider = getattr(self, "thumbnail_size_slider", None)
+        if slider is not None and slider.value() != value:
+            with QSignalBlocker(slider):
+                slider.setValue(value)
+
+    def _on_thumbnail_size_slid(self, value: int) -> None:
+        """ドラッグ中は数値表示だけ動かし、止まってからカード再レイアウトを適用する。
+        毎シグナル適用だと全サムネイルの読み直しが入って重くなる。
+        値は THUMBNAIL_SIZE_STEP 刻みに寄せる（PySide6 の QSlider に setSnapToTicks は無い）。"""
+        steps = round((value - THUMBNAIL_SIZE_MIN) / THUMBNAIL_SIZE_STEP)
+        snapped = max(THUMBNAIL_SIZE_MIN, min(THUMBNAIL_SIZE_MAX, THUMBNAIL_SIZE_MIN + steps * THUMBNAIL_SIZE_STEP))
+        if snapped != value:
+            with QSignalBlocker(self.thumbnail_size_slider):
+                self.thumbnail_size_slider.setValue(snapped)
+        self.thumbnail_size_display.setText(f"{snapped} px")
+        self._size_apply_timer.start()
 
     def _apply_uniform_control_height(self, height: int = UI_CONTROL_HEIGHT) -> None:
         widgets = [
             self.search_edit,
-            self.thumbnail_size_display,
         ]
         for widget in widgets:
             widget.setFixedHeight(height)
 
         button_widgets = [
-            self.thumbnail_size_decrease_button,
-            self.thumbnail_size_increase_button,
             self.copy_all_with_lora_button,
             self.copy_all_without_lora_button,
             self.edit_button,
         ]
         for widget in button_widgets:
-            widget.setFixedHeight(UI_BUTTON_HEIGHT)
+            # app_style の既定ボタンは content 34px + border 2px = 外側36px。
+            # styleSheet の max-height が setFixedHeight より優先されるので同じ値に揃える。
+            widget.setFixedHeight(theme.BUTTON_HEIGHT)
 
         self.path_label.setMinimumHeight(height)
         self.path_label.setMaximumHeight(height)
 
     def _apply_top_controls_compact_height(self) -> None:
+        # サムネイルサイズ操作はステータスバー側へ移したのでここでは固定しない
         for widget in (
             self.search_edit,
-            self.thumbnail_size_display,
             self.random_generation_button,
-            self.thumbnail_size_decrease_button,
-            self.thumbnail_size_increase_button,
-            self.folder_tree_button,
-            self.lora_button,
+            self.new_wildcard_button,
+            self.pane_tab_group,
             self.left_toggle_button,
             self.right_toggle_button,
-            self.result_count_label,
+            self.settings_button,
         ):
             widget.setFixedHeight(TOOLBAR_BUTTON_SIZE)
         self.top_controls.setFixedHeight(TOOLBAR_HEIGHT)
 
     def _set_result_count_label(self, count: int) -> None:
-        self.result_count_label.setText(f"{count} 件")
         if self.current_folder_prefix == "__favorites__":
             folder_info = "お気に入り"
         elif self.current_folder_prefix.startswith("__favorites__/"):
@@ -1817,7 +1816,7 @@ class MainWindow(QMainWindow):
 
     def _update_view_sizes(self) -> None:
         width = max(80, self.settings.thumbnail_size)
-        height = int(width * CARD_ICON_RATIO)
+        height = int(width * theme.CARD_ICON_RATIO)
         # setGridSize/setIconSizeは値が変化しないと内部レイアウトの再計算を
         # スキップすることがあるため、一度リセットしてから設定し直す。
         self.card_view.setGridSize(QSize())
@@ -1834,6 +1833,10 @@ class MainWindow(QMainWindow):
         frame_padding = 12
         return rows * row_height + frame_padding
 
+    def _apply_lora_list_height(self, rows: int) -> None:
+        # 件数が少ないときに4行分の空白を残さないよう、表示行数に応じて高さを変える
+        self.lora_list.setFixedHeight(self._lora_list_height(min(max(rows, 1), 4)))
+
     def _update_preview_pixmap(self) -> None:
         if self.current_entry is None:
             self._preview_cache_key = None
@@ -1843,10 +1846,12 @@ class MainWindow(QMainWindow):
             return
         if self.thumbnail_loading_message:
             return
-        if self.current_entry.thumbnail_path and Path(self.current_entry.thumbnail_path).exists():
+        # めくった枚数を右パネルにも反映する（カードと同じ画像を見たい）
+        preview_path = self.list_model.display_path_for(self.current_entry)
+        if preview_path and Path(preview_path).exists():
             target_size = self.thumbnail_label.contentsRect().size()
             if target_size.width() > 0 and target_size.height() > 0:
-                cache_key = (self.current_entry.thumbnail_path, target_size.width(), target_size.height())
+                cache_key = (preview_path, target_size.width(), target_size.height())
                 if self._preview_cache_key == cache_key and self._preview_cache_pixmap is not None:
                     self.thumbnail_label.setPixmap(self._preview_cache_pixmap)
                     self.thumbnail_label.setText("")
@@ -1855,7 +1860,7 @@ class MainWindow(QMainWindow):
                 self.thumbnail_label.setText("読み込み中...")
                 self._preview_request_token += 1
                 token = self._preview_request_token
-                self._queue_preview_load(self.current_entry.abs_path, self.current_entry.thumbnail_path, target_size.width(), target_size.height(), token)
+                self._queue_preview_load(self.current_entry.abs_path, preview_path, target_size.width(), target_size.height(), token)
                 return
         self.thumbnail_label.setPixmap(QPixmap())
         self.thumbnail_label.setText("サムネイルなし")
@@ -1965,13 +1970,19 @@ class MainWindow(QMainWindow):
         self.list_model.preload_rows(max(0, start - 1), min(len(self.filtered_entries) - 1, end + 3), priority=1)
 
     def _update_panel_toggle_buttons(self) -> None:
+        # アイコンの帯が「塗り=表示中 / 点線枠=隠れている」。向き矢印はどちらの
+        # パネルを指しているのか読めないので使わない（ユーザー指摘）。
         sizes = self.splitter.sizes()
         left_visible = len(sizes) == 3 and sizes[0] > 0
         right_visible = len(sizes) == 3 and sizes[2] > 0
-        self.left_toggle_button.setText("◀" if left_visible else "▶")
-        self.left_toggle_button.setToolTip("左パネルを隠す" if left_visible else "左パネルを表示")
-        self.right_toggle_button.setText("▶" if right_visible else "◀")
-        self.right_toggle_button.setToolTip("右パネルを隠す" if right_visible else "右パネルを表示")
+        self.left_toggle_button.setIcon(icon_panel("left", left_visible))
+        self.left_toggle_button.setToolTip("フォルダパネルを隠す" if left_visible else "フォルダパネルを表示")
+        self.right_toggle_button.setIcon(icon_panel("right", right_visible))
+        self.right_toggle_button.setToolTip("詳細パネルを隠す" if right_visible else "詳細パネルを表示")
+        # isHidden() は親の表示状態に依存しない明示フラグなので、ウィンドウ表示前でも
+        # 「開いている方」が正しく光る（isVisible() だと起動時に両方消灯する）
+        self.folder_tree_button.setChecked(not self.folder_tree_container.isHidden())
+        self.lora_button.setChecked(not self.lora_container.isHidden())
 
     def toggle_left_panel(self) -> None:
         sizes = self.splitter.sizes()
@@ -2095,6 +2106,7 @@ class MainWindow(QMainWindow):
             self.settings_store.save(self.settings)
             self._update_thumbnail_size_display(self.settings.thumbnail_size)
             self.list_model.set_thumbnail_size(self.settings.thumbnail_size)
+            self._sync_gallery_source()
             self._update_view_sizes()
             self._update_fs_watcher()
             self.statusBar().showMessage("設定を保存しました", 4000)
@@ -2488,11 +2500,13 @@ class MainWindow(QMainWindow):
         self.fav_folder_children_map = fav_children
 
     def _refresh_favorites_tree(self) -> None:
-        """お気に入りのトグル後に ★ お気に入り 配下の子だけを再構築する。"""
+        """お気に入りのトグル後にお気に入り配下の子だけを再構築する（件数も更新）。"""
         self._rebuild_fav_children_map()
         fav_item = self._find_favorites_item()
         if fav_item is None:
             return
+        self._folder_counts = self._build_folder_counts()
+        self._set_folder_item_count(fav_item)
         if self.fav_folder_children_map.get(""):
             fav_item.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
         if not self._is_folder_item_populated(fav_item):
@@ -2507,24 +2521,26 @@ class MainWindow(QMainWindow):
 
     def _rebuild_folder_tree(self) -> None:
         self._folder_tree_populating = True
+        self._folder_counts = self._build_folder_counts()
         try:
             self.folder_tree.clear()
             self.folder_tree.setUpdatesEnabled(False)
             self.folder_tree.blockSignals(True)
 
-            fav_item = QTreeWidgetItem(["★ お気に入り"])
+            fav_item = QTreeWidgetItem(["お気に入り", ""])
             fav_item.setData(0, Qt.UserRole, "__favorites__")
-            fav_icon_type = getattr(QStyle, "SP_FileDialogFavorite", QStyle.SP_DirHomeIcon)
-            fav_item.setIcon(0, self.style().standardIcon(fav_icon_type))
+            fav_item.setIcon(0, icon_star())
             fav_item.setData(0, Qt.UserRole + 1, False)
+            self._set_folder_item_count(fav_item)
             if self.fav_folder_children_map.get(""):
                 fav_item.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
             self.folder_tree.addTopLevelItem(fav_item)
 
-            root = QTreeWidgetItem(["(all)"])
+            root = QTreeWidgetItem(["(all)", ""])
             root.setData(0, Qt.UserRole, "")
-            root.setIcon(0, self.style().standardIcon(QStyle.SP_DirHomeIcon))
+            root.setIcon(0, icon_home())
             root.setData(0, Qt.UserRole + 1, False)
+            self._set_folder_item_count(root)
             self.folder_tree.addTopLevelItem(root)
 
             self._populate_folder_children(root)
@@ -2539,6 +2555,24 @@ class MainWindow(QMainWindow):
 
     def _folder_item_key(self, item: QTreeWidgetItem) -> str:
         return str(item.data(0, Qt.UserRole) or "")
+
+    def _build_folder_counts(self) -> dict[str, int]:
+        """ツリー各ノードの件数。表示フィルタと同じ「自分＋子孫」の再帰カウント。
+        お気に入りノードは favorite_paths との積だけで数える（クリック時の結果と一致させる）。"""
+        counts: dict[str, int] = {}
+        for entry in self.entries:
+            parts = entry.folder.split("/") if entry.folder else []
+            ancestors = [""] + ["/".join(parts[: i + 1]) for i in range(len(parts))]
+            for key in ancestors:
+                counts[key] = counts.get(key, 0) + 1
+            if entry.abs_path in self.favorite_paths:
+                for key in ancestors:
+                    fav_key = "__favorites__" if not key else f"__favorites__/{key}"
+                    counts[fav_key] = counts.get(fav_key, 0) + 1
+        return counts
+
+    def _set_folder_item_count(self, item: QTreeWidgetItem) -> None:
+        item.setText(1, str(self._folder_counts.get(self._folder_item_key(item), 0)))
 
     def _is_folder_item_populated(self, item: QTreeWidgetItem) -> bool:
         return bool(item.data(0, Qt.UserRole + 1))
@@ -2562,10 +2596,11 @@ class MainWindow(QMainWindow):
         for child_name in sorted(children_map.get(sub_key, set()), key=natural_sort_key):
             child_rel = child_name if not sub_key else f"{sub_key}/{child_name}"
             child_key = f"{key_prefix}/{child_name}" if key_prefix else child_name
-            child = QTreeWidgetItem([child_name])
+            child = QTreeWidgetItem([child_name, ""])
             child.setData(0, Qt.UserRole, child_key)
             child.setData(0, Qt.UserRole + 1, False)
-            child.setIcon(0, self.style().standardIcon(QStyle.SP_DirIcon))
+            child.setIcon(0, icon_folder())
+            self._set_folder_item_count(child)
             if children_map.get(child_rel):
                 child.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
             item.addChild(child)
@@ -2653,6 +2688,24 @@ class MainWindow(QMainWindow):
         self.schedule_apply_filters()
 
     @staticmethod
+    def _base_model_from_name(text: str) -> str:
+        """LoRA名／ベース名から 'Anima' / 'Illustrious' / '' を名前言依りで判定する。
+
+        'anime' と 'anima' を取り違えないよう、照合はセパレータ区切りの
+        トークン完全一致に限る。'il' も単独トークンまたは il+バージョン
+        （ilv5 等）のみ有効で、'detail' / 'file' / 'wild' 等の単語内 'il' は
+        反応しない。
+        """
+        tokens = [t for t in re.split(r"[^a-z0-9]+", text.lower()) if t]
+        if "anima" in tokens:
+            return "Anima"
+        if any("illustrious" in t for t in tokens):
+            return "Illustrious"
+        if any(re.fullmatch(r"il(v\d\w*)?", t) for t in tokens):
+            return "Illustrious"
+        return ""
+
+    @staticmethod
     def _classify_safetensor_header(path: Path) -> str:
         """safetensorsヘッダーのみで 'Anima' / 'Illustrious' / '' を返す。
 
@@ -2705,70 +2758,337 @@ class MainWindow(QMainWindow):
             return ""
         return ""
 
-    def _refresh_lora_base_model_map(self) -> None:
-        """lora_root配下の *.cm-info.json から {lora名.lower(): BaseModel} を再構築する。
+    def _lora_search_roots(self) -> list[Path]:
+        """LoRA重みとメタデータが置かれ得るフォルダ一覧を返す。
 
-        ファイル名は `{lora名}.cm-info.json` のため、stem から `.cm-info` を
-        除去してLoRA名に戻す。失敗ファイルは無視する。
-        cm-info が無い・BaseModel が Unknown のLoRAのうち、ワイルドカードから
-        参照されているものに限り、safetensorsヘッダーでフォールバック判定する
-        （全件ヘッダー読みは遅いため対象を絞る）。
+        Neo/Forge は `<lora:x>` を Lora/ だけでなく LyCORIS/ からも読むため、
+        cm-info.json は兄弟の LyCORIS にも存在する
+        （例: LyCORIS/bunny girl_illustrious_V1.0.cm-info.json）。
+        """
+        lora_root = (self.settings.lora_root or "").strip()
+        if not lora_root:
+            return []
+        primary = Path(lora_root)
+        if not primary.is_dir():
+            return []
+        roots = [primary]
+        sibling = primary.parent / "LyCORIS"
+        if sibling.is_dir():
+            roots.append(sibling)
+        return roots
+
+    @staticmethod
+    def _walk_lora_files(roots: list[Path]) -> tuple[dict[str, Path], list[Path], list[Path]]:
+        """LoRAフォルダ群を1回だけ歩き、重みとsidecarに振り分ける。
+
+        返すのは ①重みパス索引 `{stem.lower(): Path}` ②cm-info.json 一覧
+        ③civitai.info 一覧。ファイル内容は読まず、名前の拡張子だけで分類する。
+        LOST 判定は ① の実在性だけで行う：sidecar（cm-info / civitai.info /
+        metadata.json / preview画像）は重み削除後も残るため、sidecarの有無は
+        「LoRAが読み込めるか」を意味しない。
+        """
+        weights: dict[str, Path] = {}
+        cm_infos: list[Path] = []
+        civitai_infos: list[Path] = []
+        for root in roots:
+            try:
+                paths = list(root.rglob("*"))
+            except Exception:
+                continue
+            for path in paths:
+                low = path.name.lower()
+                if low.endswith(".cm-info.json"):
+                    cm_infos.append(path)
+                elif low.endswith(".civitai.info"):
+                    civitai_infos.append(path)
+                elif low.endswith((".safetensors", ".ckpt", ".pt", ".bin")):
+                    weights.setdefault(lora_name_key(path.stem), path)
+        return weights, cm_infos, civitai_infos
+
+    @staticmethod
+    def _lora_tail_name(key: str) -> str:
+        """`<lora:sub/name>` 形式の参照を末尾名でも拾えるようにする。"""
+        return key.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+
+    @classmethod
+    def _lora_name_present(cls, key: str, index: dict[str, Path]) -> bool:
+        """索引上で重みファイルが実在するか。フォルダ付き参照は末尾名でも見る。"""
+        return key in index or cls._lora_tail_name(key) in index
+
+    @classmethod
+    def _compute_lost_lora_names(cls, referenced: set[str], index: dict[str, Path]) -> set[str]:
+        return {key for key in referenced if not cls._lora_name_present(key, index)}
+
+    def _refresh_lora_weight_index(self) -> dict[str, Path]:
+        """名前walkだけで重み索引を作り直し、LOST集合にも反映する（実測 93ms）。
+
+        baseモデル判定（sidecar読込＋ヘッダー抽出で1.5s）は行わないので、
+        ill/aniバッジの鮮度は `_refresh_lora_base_model_map`（手動再スキャン）側で
+        更新されるまで据え置きになる。
+        `_lost_lora_names` は中身その入れ替えにする（list_model と同じオブジェクトを
+        共有しているため、差し替えると表示側が古い集合を参照し続ける）。
+        """
+        roots = [root for root in self._lora_search_roots() if root.is_dir()]
+        index, _cm_infos, _civitai_infos = self._walk_lora_files(roots)
+        referenced: set[str] = set()
+        for entry in self.entries:
+            for name in entry.lora_names or []:
+                key = lora_name_key(name)
+                if key:
+                    referenced.add(key)
+        lost = self._compute_lost_lora_names(referenced, index)
+        changed = lost != self._lost_lora_names
+        self._lost_lora_names.clear()
+        self._lost_lora_names.update(lost)
+        if changed:
+            self.card_view.viewport().update()
+        return index
+
+    def _missing_copy_lora_names(self, text: str) -> list[str]:
+        """コピーするテキスト中の `<lora:x>` で、ディスク上に重みが無い物を元の表記で返す。
+
+        QFileSystemWatcher が張っているのはワイルドカードライブラリ側だけで、
+        LoRAフォルダの削除は追従しない。そのため索引を信じずコピー時に必ず
+        名前walkをやり直す（実測 93〜130ms。ヘッダー解析1.5sは伴わない）。
+        LoRAフォルダが未設定・未存在なら実在性そのものが判定不能なので、
+        全LoRAを欠陥品として警告せずそのまま通す。
+        """
+        names = extract_lora_names(text)
+        if not names:
+            return []
+        if not any(root.is_dir() for root in self._lora_search_roots()):
+            return []
+        index = self._refresh_lora_weight_index()
+        return [name for name in names
+                if not self._lora_name_present(lora_name_key(name), index)]
+
+    @staticmethod
+    def _scan_lora_weight_headers(weights: dict[str, Path]) -> dict[str, tuple[Path, dict[str, str]]]:
+        """重みファイルのヘッダーからBaseModel判定に使う値だけを抽出する。
+
+        返り値は `{lora名.lower(): (パス, {キー: 値})}`。値はすべて小文字化する。
+        ヘッダーが異常に大きい・読めないファイルは値なしで登録する
+        （重みが存在するという事実自体が次の判定に効くため）。
+        """
+        found: dict[str, tuple[Path, dict[str, str]]] = {}
+        for key, path in weights.items():
+            fields: dict[str, str] = {}
+            try:
+                with path.open("rb") as handle:
+                    (size,) = struct.unpack("<Q", handle.read(8))
+                    if size > LORA_HEADER_MAX_BYTES:
+                        found[key] = (path, fields)
+                        continue
+                    blob = handle.read(size)
+            except Exception:
+                found[key] = (path, fields)
+                continue
+            for name, pattern in LORA_HEADER_PATTERNS.items():
+                match = pattern.search(blob)
+                if match:
+                    fields[name] = match.group(1).decode("utf-8", "replace").strip().lower()
+            found[key] = (path, fields)
+        return found
+
+    @staticmethod
+    def _build_base_hash_registry(
+        headers: dict[str, tuple[Path, dict[str, str]]],
+        mapping: dict[str, str],
+    ) -> dict[str, str]:
+        """BaseModel確定済みLoRAの「学習時ベースチェックポイントのハッシュ」を集計する。
+
+        kohyaはヘッダーに `ss_new_sd_model_hash`（ベース実体のSHA256）と
+        `ss_sd_model_hash`（同レガシーハッシュ）を書き込む。これは学習に使った
+        ベースモデルそのものの識別子なので、BaseModelが確定しているLoRAと同じ
+        ハッシュなら、そのLoRAも同じBaseModelで学習されていることになる。
+        `ss_sd_model_name` が `889818.safetensors` のようにCivitaiの数値IDだけの
+        場合、名从前手が全く効かないが、このハッシュ経路なら確定できる。
+
+        投票が割れているハッシュ（Illustrious/NoobAI 混在など）は除外する。
+        """
+        votes: dict[str, Counter[str]] = {}
+        display: dict[str, str] = {}
+        for name, (_path, fields) in headers.items():
+            raw = str(mapping.get(name) or "").strip()
+            base = raw.lower()
+            if not base or base in ("unknown", "none", "other"):
+                continue
+            display.setdefault(base, raw)
+            for key in ("new_hash", "old_hash"):
+                digest = fields.get(key) or ""
+                if digest:
+                    votes.setdefault(digest, Counter())[base] += 1
+        registry: dict[str, str] = {}
+        for digest, counter in votes.items():
+            base, top = counter.most_common(1)[0]
+            if top / sum(counter.values()) >= LORA_HASH_REGISTRY_MIN_RATIO:
+                registry[digest] = display.get(base, base)
+        return registry
+
+    def _refresh_lora_base_model_map(self) -> None:
+        """ベースモデルスキャンをスレッドプールで開始する（メインスレッドを塞がない）。
+
+        全LoRAフォルダの歩行＋全safetensorsヘッダー解析で実測1.5s以上かかるため、
+        起動時にメインスレッドで実行するとWindowsの「応答なし」になる。入力
+        （roots / referenced）だけメインスレッドで取り、結果は
+        `lora_base_scan_done` シグナル経由で `_apply_lora_base_model_result`
+        に反映する。実行中は `_lora_base_scan_running` で多重起動を防ぐ。
+        """
+        if self._lora_base_scan_running:
+            return
+        roots = self._lora_search_roots()
+        referenced: set[str] = set()
+        for entry in self.entries:
+            for name in entry.lora_names or []:
+                key = lora_name_key(name)
+                if key:
+                    referenced.add(key)
+        self._lora_base_scan_running = True
+
+        def work() -> None:
+            try:
+                result = MainWindow._scan_lora_base_model_snapshot(roots, referenced)
+            except Exception:
+                log.exception("LoRAベースモデルスキャン失敗")
+                result = None
+            self.lora_base_scan_done.emit(result)
+
+        QThreadPool.globalInstance().start(work)
+
+    def _apply_lora_base_model_result(self, result: object) -> None:
+        """ワーカースレッドの走査結果をメインスレッドでUIへ反映する。"""
+        self._lora_base_scan_running = False
+        if not isinstance(result, tuple):
+            return
+        mapping, lost = result
+        log.info("LoRAベースモデル走査完了 map=%d lost=%d", len(mapping), len(lost))
+        # list_model と同じオブジェクトを共有し続けるため中身その入れ替えにする
+        # （`_refresh_lora_weight_index` と同じ理由）
+        self._lora_base_model_map.clear()
+        self._lora_base_model_map.update(mapping)
+        self._lost_lora_names.clear()
+        self._lost_lora_names.update(lost)
+        self._repopulate_model_filter_combo()
+        self.card_view.viewport().update()
+        self.schedule_apply_filters()
+
+    @classmethod
+    def _scan_lora_base_model_snapshot(
+        cls,
+        roots: "list[Path]",
+        referenced: "set[str]",
+    ) -> "tuple[dict[str, str], set[str]]":
+        """{lora名.lower(): BaseModel} と LOST 集合を作る（ワーカースレッド実行）。
+
+        根拠の強い順に埋める。
+        ①`{lora名}.cm-info.json` の BaseModel（一次情報。Civitai Model Converterが書く）
+        ②`{lora名}.civitai.info` の baseModel
+        ③ベースチェックポイントのハッシュ registry（`_build_base_hash_registry`）
+        ④safetensorsヘッダー自身（architecture / ss_base_model_version / 学習時ベース名）
+        ⑤LoRA名自身のトークン（illustrious / anima / il系）
+        ③は全重みを1回スキャンして作るが、確定済みLoRAの投票が9割以上一つに固まる
+        ハッシュだけ使うので推測ではなく実測根拠になる。④⑤はワイルドカードから
+        参照されている名前にだけ適用する。失敗ファイルは無視する。
+
+        同じ歩行で「参照されているのに重みファイルが存在しないLoRA名」も求め、
+        カードの LOST 表示（減光＋ピル）に使う。sidecarだけ残っている場合も
+        Neo/Forge は読み込めないので LOST 側に入る。
+
+        Qtオブジェクトには触れず、ディスクI/Oと純データだけを行うので
+        ワーカースレッドから呼んで安全。
         """
         mapping: dict[str, str] = {}
-        lora_root = (self.settings.lora_root or "").strip()
-        root: Path | None = None
-        if lora_root:
-            root = Path(lora_root)
-            if root.exists():
-                try:
-                    for cm_info in root.rglob("*.cm-info.json"):
-                        try:
-                            stem = cm_info.stem  # "{name}.cm-info"
-                            lora_name = stem[:-len(".cm-info")] if stem.endswith(".cm-info") else stem
-                            if not lora_name:
-                                continue
-                            with cm_info.open("r", encoding="utf-8") as handle:
-                                cm_data = json.load(handle)
-                            base_model = str(cm_data.get("BaseModel", "") or "").strip()
-                            if base_model:
-                                mapping[lora_name.lower()] = base_model
-                        except Exception:
-                            continue
-                except Exception:
-                    pass
-        if root is not None:
+
+        def record(name: str, base_model: str, *, overwrite: bool) -> None:
+            key = lora_name_key(name)
+            base_model = str(base_model or "").strip()
+            if not key or not base_model:
+                return
+            if not overwrite:
+                known = (mapping.get(key) or "").strip().lower()
+                if known and known != "unknown":
+                    return
+            mapping[key] = base_model
+
+        weight_index, cm_infos, civitai_infos = cls._walk_lora_files(roots)
+        for cm_info in cm_infos:
             try:
-                needed: set[str] = set()
-                for entry in self.entries:
-                    for name in entry.lora_names or []:
-                        key = str(name).strip().lower()
-                        known = (mapping.get(key) or "").strip().lower()
-                        if not known or known == "unknown":
-                            needed.add(key)
-                if needed:
-                    safetensors_index: dict[str, Path] = {}
-                    for safetensors in root.rglob("*.safetensors"):
-                        safetensors_index.setdefault(safetensors.stem.lower(), safetensors)
-                    for key in needed:
-                        target = safetensors_index.get(key)
-                        if target is None:
-                            continue
-                        guessed = self._classify_safetensor_header(target)
-                        if guessed:
-                            mapping[key] = guessed
+                stem = cm_info.stem  # "{name}.cm-info"
+                lora_name = stem[:-len(".cm-info")] if stem.endswith(".cm-info") else stem
+                with cm_info.open("r", encoding="utf-8") as handle:
+                    cm_data = json.load(handle)
+                record(lora_name, cm_data.get("BaseModel", ""), overwrite=True)
+            except Exception:
+                continue
+        for info in civitai_infos:
+            try:
+                with info.open("r", encoding="utf-8-sig") as handle:
+                    info_data = json.load(handle)
+                record(info.name[: -len(".civitai.info")],
+                       info_data.get("baseModel", ""), overwrite=False)
+            except Exception:
+                continue
+        headers = cls._scan_lora_weight_headers(weight_index)
+        if headers:
+            try:
+                registry = cls._build_base_hash_registry(headers, mapping)
+                for name, (_path, fields) in headers.items():
+                    base = registry.get(fields.get("new_hash") or "") or \
+                        registry.get(fields.get("old_hash") or "")
+                    if base:
+                        record(name, base, overwrite=False)
             except Exception:
                 pass
-        self._lora_base_model_map = mapping
-        self.list_model.lora_base_model_map = self._lora_base_model_map
+        try:
+            needed = {key for key in referenced
+                      if not (mapping.get(key) or "").strip().lower()
+                      or (mapping.get(key) or "").strip().lower() == "unknown"}
+            for key in needed:
+                target = weight_index.get(key)
+                guessed = ""
+                if target is not None:
+                    # テンソルキーの指紋まで見る重い判定は参照済み名前だけに行う
+                    guessed = cls._classify_safetensor_header(target)
+                if not guessed:
+                    # 重みファイルが消えているLoRAは名前の手がかりが唯一の根拠になる
+                    guessed = cls._base_model_from_name(key)
+                if guessed:
+                    mapping[key] = guessed
+        except Exception:
+            pass
+        # 重みファイルが1個も無い名前 = LoRA削除後に放置された参照
+        lost = cls._compute_lost_lora_names(referenced, weight_index)
+        return mapping, lost
 
-    def _entry_base_kinds(self, entry: WildcardEntry) -> set[str]:
-        """エントリが使うLoRAのBaseModel種別 {"illustrious","anima"} を返す。"""
-        kinds: set[str] = set()
+    def _repopulate_model_filter_combo(self) -> None:
+        """固定リストにせず、LoRAフォルダに実在するBaseModelだけを列挙する。"""
+        combo = self.model_filter_combo
+        previous = combo.currentData() if combo.count() else None
+        display: dict[str, str] = {}
+        for base_model in self._lora_base_model_map.values():
+            text = str(base_model or "").strip()
+            if not text or text.lower() == "unknown":
+                continue
+            display.setdefault(text.lower(), text)
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            combo.addItem("すべて", "")
+            for key in sorted(display):
+                combo.addItem(display[key], key)
+            combo.addItem("LoRAなし", NOLORA_FILTER)
+            combo.setCurrentIndex(max(combo.findData(previous or ""), 0))
+        finally:
+            combo.blockSignals(False)
+
+    def _entry_base_models(self, entry: WildcardEntry) -> set[str]:
+        """エントリが使うLoRAのBaseModel集合（cm-info.jsonの値を小文字化）。Unknownは除外。"""
+        models: set[str] = set()
         for name in entry.lora_names or []:
-            bm = (self._lora_base_model_map.get(str(name).strip().lower()) or "").strip().lower()
-            if bm in ("illustrious", "anima"):
-                kinds.add(bm)
-        return kinds
+            base_model = (self._lora_base_model_map.get(lora_name_key(name)) or "").strip().lower()
+            if base_model and base_model != "unknown":
+                models.add(base_model)
+        return models
 
     def _populate_lora_cloud(self) -> None:
         self.lora_cloud.clear()
@@ -3240,6 +3560,12 @@ class MainWindow(QMainWindow):
     def schedule_apply_filters(self) -> None:
         self.filter_timer.start()
 
+    def _search_by_tag(self, tag: str) -> None:
+        """タグ右クリックメニュー「検索」: 検索欄に語を入れてカード一覧を絞り込む"""
+        self.search_edit.setText(tag)  # 変化があれば textChanged 経由で schedule される
+        self.search_edit.setFocus()
+        self.schedule_apply_filters()
+
     def apply_filters(self) -> None:
         query = self.search_edit.text().strip().lower()
         selected_abs = self.current_entry.abs_path if self.current_entry else None
@@ -3284,20 +3610,13 @@ class MainWindow(QMainWindow):
             if selected_loras:
                 if not selected_loras.issubset(set(entry.lora_names)):
                     return False
-            if model_filter == "nolora":
+            if model_filter == NOLORA_FILTER:
                 if entry.lora_names:
                     return False
-            elif model_filter in ("illustrious", "anima", "mix"):
-                kinds = self._entry_base_kinds(entry)
-                if model_filter == "illustrious":
-                    if kinds != {"illustrious"}:
-                        return False
-                elif model_filter == "anima":
-                    if kinds != {"anima"}:
-                        return False
-                else:  # mix
-                    if kinds != {"illustrious", "anima"}:
-                        return False
+            elif model_filter:
+                # 単一BaseModel一致。混在エントリはどのモデルにも含まれない
+                if self._entry_base_models(entry) != {model_filter}:
+                    return False
             if not query:
                 return True
             return query in self.search_cache.get(entry.abs_path, "")
@@ -3326,6 +3645,7 @@ class MainWindow(QMainWindow):
         self._refresh_path_label()
         self._update_preview_pixmap()
         self.lora_list.clear()
+        self._apply_lora_list_height(0)
         self.prompt_tags_edit.set_tags([])
         self.editor.clear()
 
@@ -3347,8 +3667,17 @@ class MainWindow(QMainWindow):
             return
         self.current_entry = entry
         self._show_entry(entry)
+        # 2枚以上持つカードは「めくる」方に使い、1枚だけのカードは従来通りコピー。
+        # コピー手順を失わないよう、多画像カードでも Ctrl+ダブルクリック＝コピー。
+        if not (QApplication.queryKeyboardModifiers() & Qt.ControlModifier):
+            page = self.list_model.flip_to_next(entry)
+            if page is not None:
+                self._update_preview_pixmap()
+                total = self.list_model.variant_count(entry)
+                self.show_toast(f"{page}/{total}枚目を表示")
+                return
+        # トーストは copy_all_text 側が出す（LoRA欠損時は警告に差し替わる）
         self.copy_all_text(True)
-        self.show_toast("Copied")
 
     def _show_entry(self, entry: WildcardEntry) -> None:
         self._set_edit_mode(False)
@@ -3357,6 +3686,7 @@ class MainWindow(QMainWindow):
         self.lora_list.clear()
         for name in entry.lora_names:
             self.lora_list.addItem(name)
+        self._apply_lora_list_height(len(entry.lora_names))
         cached_content = self._content_load_cache.get(entry.abs_path)
         if cached_content is not None:
             # H10 修正: 参照されたエントリを最新としてマーク
@@ -3475,12 +3805,29 @@ class MainWindow(QMainWindow):
         fav_action = menu.addAction(fav_label)
         menu.addSeparator()
         thumb_action = menu.addAction("サムネ生成")
+        assign_thumb_action = menu.addAction("サムネイルに画像を指定...")
+        add_thumb_action = menu.addAction("サムネイルに画像を追加...")
+        # 複数枚カードは「どの枚を消すか」を menu 上で直接選べるようにする。
+        # 表示中1枚だけを消す方式だと、目的の枚へめくり当てる手順が隠れる。
+        gallery_pages = self.list_model.gallery_paths(entry)
+        del_thumb_action = None
+        if len(gallery_pages) >= 2:
+            delete_menu = menu.addMenu("サムネイルを削除...")
+            shown_path = self.list_model.display_path_for(entry)
+            for page_pos, page_path in enumerate(gallery_pages):
+                mark = "（表示中）" if thumbnail_paths_equal(page_path, shown_path) else ""
+                page_action = delete_menu.addAction(f"{page_pos + 1}枚目: {Path(page_path).name}{mark}")
+                page_action.triggered.connect(
+                    lambda checked=False, pos=page_pos: self.delete_thumbnail_image(entry, page_index=pos))
+        else:
+            del_thumb_action = menu.addAction("このサムネイルを削除...")
+        del_all_thumb_action = menu.addAction("サムネイルをすべて削除...")
         random_action = menu.addAction("固定プロンプトに入れる")
         menu.addSeparator()
-        copy_all_action = menu.addAction("プロンプトコピー（LORAあり）")
-        copy_all_without_action = menu.addAction("プロンプトコピー（LORAなし）")
+        copy_all_action = menu.addAction("LoRAありでコピー")
+        copy_all_without_action = menu.addAction("LoRAなしでコピー")
         if entry.lora_names:
-            search_menu = menu.addMenu("LORAで絞り込み")
+            search_menu = menu.addMenu("LoRAで絞り込み")
             for name in entry.lora_names:
                 action = search_menu.addAction(name)
                 action.triggered.connect(lambda checked=False, n=name: self._check_lora_in_cloud(n))
@@ -3497,6 +3844,14 @@ class MainWindow(QMainWindow):
             self._toggle_favorite(entry)
         elif action == thumb_action:
             self.generate_thumbnail_for_current()
+        elif action == assign_thumb_action:
+            self.assign_thumbnail_from_image(entry)
+        elif action == add_thumb_action:
+            self.add_thumbnail_image(entry)
+        elif del_thumb_action is not None and action == del_thumb_action:
+            self.delete_thumbnail_image(entry)
+        elif action == del_all_thumb_action:
+            self.delete_thumbnail_image(entry, all_pages=True)
         elif action == random_action:
             self.open_random_generation(entry)
         elif action == copy_all_action:
@@ -3698,11 +4053,8 @@ class MainWindow(QMainWindow):
                     raw_image.loadFromData(raw_bytes)
                     if not raw_image.isNull():
                         thumb_size = max(80, self.list_model.thumbnail_size)
-                        scaled = raw_image.scaled(
-                            QSize(thumb_size, int(thumb_size * 1.5)),
-                            Qt.KeepAspectRatio,
-                            Qt.SmoothTransformation,
-                        )
+                        scaled = cover_crop(raw_image, thumb_size,
+                                            int(thumb_size * theme.CARD_ICON_RATIO))
                         if not scaled.isNull():
                             # 【方針B】rel_path を渡す
                             self.list_model.set_icon_directly(updated.rel_path, scaled)
@@ -3723,13 +4075,31 @@ class MainWindow(QMainWindow):
     def _prepare_copy_text(self, text: str, include_lora: bool) -> str:
         return text.strip() if include_lora else strip_lora_tags(text)
 
-    def copy_all_text(self, include_lora: bool | None = None) -> None:
+    def copy_all_text(self, include_lora: bool | None = None) -> list[str]:
+        """全文をクリップボードへコピーし、実在しないLoRA名の一覧を返す。
+
+        戻り値は `include_lora` が実効 True のときだけ中身が入る（LoRAなしコピーでは
+        `<lora:...>` を書く必要が無いので判定しない）。コピー自体は実行済みで、
+        見つからない名前があっても止めない ―― 生ファイルはNeo/Forge側で
+        無視されるだけなので、警告して判断はユーザーに残す。
+        """
         if not self.current_entry:
-            return
+            return []
         include = self.settings.include_lora_on_copy if include_lora is None else include_lora
         text = self._prepare_copy_text(self.editor.toPlainText(), include)
         QApplication.clipboard().setText(text, QClipboard.Clipboard)
-        self.statusBar().showMessage(f"全文をコピーしました（{'LoRAあり' if include else 'LoRAなし'}）", 3000)
+        missing = self._missing_copy_lora_names(text) if include else []
+        if missing:
+            shown = "、".join(missing[:3]) + ("…" if len(missing) > 3 else "")
+            self.statusBar().showMessage(
+                f"コピーしました（LoRAあり）／実在しないLoRA {len(missing)}件: {shown}"
+                "　※「LoRAなし」でコピーすると安全です", 8000)
+            # 名前を自力で読む時間が必要なので、確認トーストより長めに出す
+            self.show_toast(f"LoRAが見つかりません（削除済み）\n{shown}", 5000)
+        else:
+            self.statusBar().showMessage(f"全文をコピーしました（{'LoRAあり' if include else 'LoRAなし'}）", 3000)
+            self.show_toast("Copied" if include else "Copied（LoRAなし）")
+        return missing
     # -------------------------------------------------------------------------
     # お気に入り機能
     # -------------------------------------------------------------------------
@@ -3777,11 +4147,19 @@ class MainWindow(QMainWindow):
         self._refresh_favorites_tree()
         self.statusBar().showMessage(msg, 3000)
 
-    def show_toast(self, message: str) -> None:
+    def show_toast(self, message: str, ms: int | None = None) -> None:
+        """トースト表示。既定時間は ToastPopup.show_for の既定（2.6秒）に従う。
+
+        読む量が要る警告（削除済みLoRA名の一覧など）だけ、呼び出し側で ms を
+        明示して延ばす。
+        """
         if self.toast_popup is not None:
             self.toast_popup.close()
         self.toast_popup = ToastPopup(self, message)
-        self.toast_popup.show_for()
+        if ms is None:
+            self.toast_popup.show_for()
+        else:
+            self.toast_popup.show_for(ms)
 
     def _advance_thumbnail_loading_animation(self) -> None:
         if not self.thumbnail_loading_message:
@@ -3943,6 +4321,174 @@ class MainWindow(QMainWindow):
         box.setDefaultButton(btn_no)
         box.exec()
         return box.clickedButton() is btn_yes
+
+    def _sync_gallery_source(self) -> None:
+        """list_model に「2枚目以降」の走査元を配線する（設定変更でも再呼び出し）。"""
+        root = _safe_resolve_path(Path(self.settings.thumbnail_root))
+        self.list_model.thumbnail_root = root
+
+        def listing(folder: str) -> list[str]:
+            target = root / folder if folder else root
+            try:
+                with os.scandir(target) as entries:
+                    return [de.name for de in entries if de.is_file()]
+            except OSError:
+                return []
+
+        self.list_model.gallery_listing_provider = listing
+
+    def _thumbnail_source_root(self) -> Path:
+        return _safe_resolve_path(Path(self.settings.thumbnail_root))
+
+    def _pick_image_path(self, title: str, entry: WildcardEntry) -> str:
+        shown = self.list_model.display_path_for(entry)
+        start_dir = str(Path(shown).parent) if shown else ""
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            title,
+            start_dir,
+            "画像 (*.png *.jpg *.jpeg *.webp *.bmp);;すべて (*)",
+        )
+        return path
+
+    def _write_thumbnail_image(self, source: str, dest: Path) -> bool:
+        """画像をサムネイル保存先（WEBP q82）へ書き出す。生成時と同じ形式・同じ上限。"""
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with Image.open(source) as src:
+                image = src.convert("RGB")
+            longest = max(image.size)
+            if longest > THUMBNAIL_ASSIGN_MAX:
+                scale = THUMBNAIL_ASSIGN_MAX / longest
+                image = image.resize(
+                    (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
+                    Image.LANCZOS,
+                )
+            image.save(dest, "WEBP", quality=82, method=6)
+            return True
+        except Exception as exc:
+            self._show_error("サムネイル登録エラー", f"{source}\n\n{exc}")
+            return False
+
+    def _refresh_entry_after_thumb_change(self, entry: WildcardEntry) -> WildcardEntry | None:
+        try:
+            updated = self.repo.refresh_entry(self.settings, Path(entry.abs_path))
+        except Exception as exc:
+            self._show_error("サムネイル反映エラー", f"ファイル操作は完了しましたが、DB反映に失敗しました。\n{exc}")
+            return None
+        self._replace_entry(updated)
+        return updated
+
+    def assign_thumbnail_from_current(self) -> None:
+        self.assign_thumbnail_from_image(self.current_entry)
+
+    def add_thumbnail_from_current(self) -> None:
+        self.add_thumbnail_image(self.current_entry)
+
+    def delete_current_thumbnail(self) -> None:
+        self.delete_thumbnail_image(self.current_entry)
+
+    def assign_thumbnail_from_image(self, entry: WildcardEntry | None) -> None:
+        """既存画像をそのカードの1枚目のサムネイルとして登録する（API生成を使わない差し替え）。
+
+        保存先は生成と同じ ``{thumbnail_root}/{rel.parent}/{stem}.preview.webp``
+        （`ensure_thumbnail_destination`）。ここが最優先候補になるので、
+        生成済み画像を後から差し替えた場合も表示が負けない。
+        """
+        if entry is None:
+            self._show_info("サムネイル登録", "カードを選択してください。")
+            return
+        path = self._pick_image_path("サムネイルに使う画像を選択", entry)
+        if not path:
+            return
+        dest = ensure_thumbnail_destination(self._thumbnail_source_root(), entry.rel_path)
+        if dest.exists() and self._ask_yes_no(
+            "サムネイル登録",
+            f"既存の1枚目を上書きします。\n\n{dest.name}",
+            default_button=QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+        if not self._write_thumbnail_image(path, dest):
+            return
+        self.list_model.reset_variant(entry.rel_path)
+        if self._refresh_entry_after_thumb_change(entry) is not None:
+            self.statusBar().showMessage(f"1枚目を登録しました: {dest.name}", 5000)
+
+    def add_thumbnail_image(self, entry: WildcardEntry | None) -> None:
+        """2枚目以降の画像を追加する（ダブルクリックでめくれるカードになる）。"""
+        if entry is None:
+            self._show_info("サムネイル追加", "カードを選択してください。")
+            return
+        pages = self.list_model.gallery_paths(entry)
+        path = self._pick_image_path("追加する画像を選択", entry)
+        if not path:
+            return
+        if not pages:
+            # 1枚目すら無いカードでは、g2 に置いても「2枚目のない1枚目」になる。
+            # そのまま1枚目として登録する（枚数の穴を埋めない）。
+            dest = ensure_thumbnail_destination(self._thumbnail_source_root(), entry.rel_path)
+        else:
+            dest = next_gallery_slot(self._thumbnail_source_root(), entry.rel_path)
+        if not self._write_thumbnail_image(path, dest):
+            return
+        self.list_model.invalidate_gallery(entry.rel_path)
+        updated = self._refresh_entry_after_thumb_change(entry)
+        if updated is not None:
+            shown = self.list_model.variant_count(updated)
+            self.show_toast(f"{shown}枚目を追加しました（ダブルクリックでめくれます）")
+            self.statusBar().showMessage(f"サムネイルを追加しました: {dest.name}", 5000)
+
+    def delete_thumbnail_image(self, entry: WildcardEntry | None, *, all_pages: bool = False,
+                              page_index: int | None = None) -> None:
+        """カードは消さずにサムネイル画像だけゴミ箱へ移動する。
+
+        既定は「表示中の1枚」。複数枚あるカードで目的の枚を消したいときは
+        `page_index`（0起点）で枚を直接指定する — めくって合わせなくても
+        右クリックから選べるほうが意図とズレない（消す対象を間違えると
+        手元に戻すのにごみ箱を開けなければならない）。
+        """
+        if entry is None:
+            self._show_info("サムネイル削除", "カードを選択してください。")
+            return
+        pages = self.list_model.gallery_paths(entry)
+        if not pages:
+            self._show_info("サムネイル削除", "このカードにサムネイルはありません。")
+            return
+        if all_pages:
+            picked = list(enumerate(pages))
+        elif page_index is not None:
+            if not 0 <= page_index < len(pages):
+                self._show_info("サムネイル削除",
+                                f"{page_index + 1}枚目は存在しません（現在 {len(pages)} 枚）。")
+                return
+            picked = [(page_index, pages[page_index])]
+        else:
+            # 表示中パスは DB 由来（`H:\`）で pages（`h:\`）と大小文字がズレるため、
+            # 枚目索引は `pages.index()` ではなく実パス同一性で引き当てる。
+            shown = self.list_model.display_path_for(entry) or pages[0]
+            pos = next((i for i, p in enumerate(pages) if thumbnail_paths_equal(p, shown)), 0)
+            picked = [(pos, pages[pos])]
+        targets = [Path(p) for _i, p in picked]
+        names = "\n".join(f"  {i + 1}枚目: {Path(p).name}" for i, p in picked[:6])
+        if len(picked) > 6:
+            names += f"\n  ... 他 {len(picked) - 6} 件"
+        if self._ask_yes_no(
+            "サムネイル削除",
+            f"カードは残し、サムネイル画像だけをゴミ箱に移動します。\n\n{names}",
+            default_button=QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+        moved = [p for p in targets if self._move_to_trash(p)]
+        if not moved:
+            self._show_error("サムネイル削除", "ゴミ箱に移動できませんでした。パス権限をご確認ください。")
+            return
+        # 削除で枚番号がずれる（g3 が残って g2 が消える等）ので、
+        # カード側の表示枚目は 1枚目へ戻して組み直す
+        self.list_model.forget_thumbnail(entry.rel_path)
+        updated = self._refresh_entry_after_thumb_change(entry)
+        if updated is not None:
+            rest = self.list_model.gallery_paths(updated)
+            self.show_toast(f"{len(moved)}枚のサムネイルを削除しました" + (f"（残り {len(rest)} 枚）" if rest else ""))
 
     def generate_thumbnail_for_current(self) -> None:
         """選択中のカード（単数または複数）のサムネイルを生成する。
@@ -4127,11 +4673,8 @@ class MainWindow(QMainWindow):
                         raw_image.loadFromData(raw_bytes)
                         if not raw_image.isNull():
                             thumb_size = max(80, self.list_model.thumbnail_size)
-                            scaled = raw_image.scaled(
-                                QSize(thumb_size, int(thumb_size * 1.5)),
-                                Qt.KeepAspectRatio,
-                                Qt.SmoothTransformation,
-                            )
+                            scaled = cover_crop(raw_image, thumb_size,
+                                                int(thumb_size * theme.CARD_ICON_RATIO))
                             if not scaled.isNull():
                                 # 【方針B】rel_path を渡す
                                 self.list_model.set_icon_directly(updated.rel_path, scaled)
@@ -4227,7 +4770,7 @@ class MainWindow(QMainWindow):
             self.settings.window_width = self.width()
             self.settings.window_height = self.height()
         self.settings.splitter_sizes = self.splitter.sizes()
-        self.settings.detail_splitter_sizes = [420, 520]
+        self.settings.left_split_sizes = self.left_split.sizes()
         # "__favorites__" 系は仮想フォルダなので保存しない（再起動時に復元不能）
         self.settings.last_folder = "" if self.current_folder_prefix.startswith("__favorites__") else self.current_folder_prefix
         self.ui_state_store.save(self.settings)

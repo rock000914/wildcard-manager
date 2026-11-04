@@ -14,6 +14,7 @@ except Exception:
 from PySide6.QtGui import QFontDatabase, QIcon, QFont
 from PySide6.QtWidgets import QApplication
 
+from wildcard_manager import theme
 from wildcard_manager.main_window import MainWindow
 
 UI_FONT_FAMILIES = ["Yu Gothic UI", "Yu Gothic", "Meiryo UI", "Meiryo", "Segoe UI", "Noto Sans CJK JP", "MS Gothic"]
@@ -50,6 +51,8 @@ def main() -> int:
     app_font = QFont(_choose_ui_font_family())
     app_font.setPointSize(9)
     app.setFont(app_font)
+    # 外観の基底は theme に一本化（各ウィジェットの setStyleSheet は上書きしたい所だけ）
+    app.setStyleSheet(theme.app_style())
     icon_path = app_dir / "assets" / "wildcard_manager_icon.ico"
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))

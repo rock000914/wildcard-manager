@@ -2,10 +2,20 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QTimer, QItemSelection, QItemSelectionModel, QModelIndex
+from PySide6.QtCore import (
+    Qt,
+    QTimer,
+    QPoint,
+    QItemSelection,
+    QItemSelectionModel,
+    QModelIndex,
+    QPropertyAnimation,
+    QEasingCurve,
+)
 from PySide6.QtGui import QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
+    QGraphicsOpacityEffect,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -15,7 +25,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-TOOLBAR_BUTTON_SIZE = 32
+from . import theme
+
+# main_window の寸法と必ず揃える（別々に持つとツールバー行の高さがずれる）
+TOOLBAR_BUTTON_SIZE = theme.ICON_BUTTON_SIZE
 
 
 class NoWheelComboBox(QComboBox):
@@ -27,9 +40,9 @@ class ApiStatusIndicator(QWidget):
     """API接続状態を示すミニマルインジケーター。「API ●」形式。"""
 
     _LAMP_COLORS = {
-        "off":        "#E74C3C",
-        "connected":  "#2ECC71",
-        "generating": "#F1C40F",
+        "off":        theme.DANGER_TEXT,
+        "connected":  theme.OK,
+        "generating": theme.WARNING,
     }
     _STATE_TOOLTIPS = {
         "off":        "API: 切断",
@@ -40,12 +53,12 @@ class ApiStatusIndicator(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._state = "off"
-        self.setStyleSheet("""
-            QFrame#apiIndicator {
-                background: #1a1d22;
-                border: 1px solid #2a3440;
-                border-radius: 4px;
-            }
+        self.setStyleSheet(f"""
+            QFrame#apiIndicator {{
+                background: {theme.PANEL_MAIN};
+                border: 1px solid {theme.BORDER};
+                border-radius: {theme.RADIUS_CHIP}px;
+            }}
         """)
         container = QFrame()
         container.setObjectName("apiIndicator")
@@ -55,7 +68,11 @@ class ApiStatusIndicator(QWidget):
         layout.setSpacing(6)
 
         self._label = QLabel("API")
-        self._label.setStyleSheet("color: #E0E0E0; font: 600 11px 'Segoe UI';")
+        # アプリ全体の QWidget{background} 指定がラベルに効いて pill 色とずれるため、透過で抜く
+        self._label.setStyleSheet(
+            f"background: transparent; color: {theme.TEXT_MUTED};"
+            f" font: 600 {theme.SMALL_SIZE + 1}px 'Segoe UI';"
+        )
         layout.addWidget(self._label)
 
         self._lamp = QLabel()
@@ -92,13 +109,13 @@ class ApiStatusIndicator(QWidget):
         if self._blink_on:
             self._lamp.setStyleSheet(f"background: {self._LAMP_COLORS['generating']}; border-radius: 5px;")
         else:
-            self._lamp.setStyleSheet("background: #1E1E1E; border-radius: 5px;")
+            self._lamp.setStyleSheet(f"background: {theme.APP_BG}; border-radius: 5px;")
 
 
 class ResponsivePixmapLabel(QLabel):
     """リサイズ対応・角丸表示のサムネイルラベル。"""
 
-    _CORNER_RADIUS = 12
+    _CORNER_RADIUS = theme.RADIUS_CARD
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -206,6 +223,12 @@ class SlowWheelListView(QListView):
 
 
 class ToastPopup(QFrame):
+    # 出現はフェードイン＋下からの短いスライド、消えるときはフェードアウト。
+    # 子ウィジェットなので windowOpacity は使えず、QGraphicsOpacityEffect で操作する
+    _FADE_IN_MS = 140
+    _FADE_OUT_MS = 240
+    _SLIDE_PX = 12
+
     def __init__(self, parent: QWidget, message: str):
         super().__init__(parent)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.SubWindow)
@@ -213,17 +236,17 @@ class ToastPopup(QFrame):
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.setObjectName("toastPopup")
         self.setStyleSheet(
-            """
-            QFrame#toastPopup {
-                background: rgba(22, 27, 33, 235);
-                border: 1px solid #3e4b57;
-                border-radius: 12px;
-            }
-            QLabel {
-                color: #f4f7fb;
-                font-size: 13px;
+            f"""
+            QFrame#toastPopup {{
+                background: rgba(27, 37, 51, 235);
+                border: 1px solid {theme.BORDER};
+                border-radius: {theme.RADIUS_PANEL}px;
+            }}
+            QLabel {{
+                color: {theme.TEXT};
+                font-size: {theme.FONT_SIZE}px;
                 padding: 10px 14px;
-            }
+            }}
             """
         )
         layout = QVBoxLayout(self)
@@ -231,13 +254,46 @@ class ToastPopup(QFrame):
         label = QLabel(message)
         layout.addWidget(label)
         self.adjustSize()
+        self._opacity = QGraphicsOpacityEffect(self)
+        self._opacity.setOpacity(0.0)
+        self.setGraphicsEffect(self._opacity)
+        self._anims: list[QPropertyAnimation] = []
 
-    def show_for(self, ms: int = 1400) -> None:
+    def show_for(self, ms: int = 2600) -> None:
         parent = self.parentWidget()
-        if parent is not None:
-            x = (parent.width() - self.width()) // 2
-            y = parent.height() - self.height() - 36
-            self.move(max(12, x), max(12, y))
-            self.raise_()
+        if parent is None:
+            self.show()
+            QTimer.singleShot(ms, self.close)
+            return
+        x = max(12, (parent.width() - self.width()) // 2)
+        y = max(12, parent.height() - self.height() - 36)
+        self.move(x, y + self._SLIDE_PX)
+        self.raise_()
         self.show()
-        QTimer.singleShot(ms, self.close)
+        fade_in = self._start(self._opacity, b"opacity", 0.0, 1.0, self._FADE_IN_MS, QEasingCurve.Type.OutCubic)
+        slide = QPropertyAnimation(self, b"pos", self)
+        slide.setDuration(self._FADE_IN_MS)
+        slide.setStartValue(self.pos())
+        slide.setEndValue(QPoint(x, y))
+        slide.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anims.append(slide)
+        slide.start()
+        QTimer.singleShot(ms, lambda: self._fade_out((fade_in, slide)))
+
+    def _fade_out(self, running) -> None:
+        for a in running:
+            a.stop()
+        # フェードイン途中の割込みでは現在値から減衰させる（1.0へ戻すとカクつく）
+        fade_out = self._start(self._opacity, b"opacity", self._opacity.opacity(), 0.0,
+                               self._FADE_OUT_MS, QEasingCurve.Type.InQuad)
+        fade_out.finished.connect(self.close)
+
+    def _start(self, target, prop, start: float, end: float, duration: int, easing: QEasingCurve.Type) -> QPropertyAnimation:
+        anim = QPropertyAnimation(target, prop, self)
+        anim.setDuration(duration)
+        anim.setStartValue(start)
+        anim.setEndValue(end)
+        anim.setEasingCurve(easing)
+        self._anims.append(anim)
+        anim.start()
+        return anim

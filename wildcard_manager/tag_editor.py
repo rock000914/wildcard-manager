@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QSize, QRect, Signal
+from PySide6.QtCore import Qt, QSize, QPoint, QRect, Signal
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
+    QApplication,
     QFrame,
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QMenu,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -14,6 +16,14 @@ from PySide6.QtWidgets import (
     QWidget,
     QLayout,
 )
+
+from . import theme
+
+
+def copy_tag_to_clipboard(tag: str) -> None:
+    clipboard = QApplication.clipboard()
+    if clipboard is not None:
+        clipboard.setText(tag)
 
 
 class FlowLayout(QLayout):
@@ -107,6 +117,11 @@ class FlowLayout(QLayout):
 class TagChip(QWidget):
     doubleClicked = Signal(str)
     clicked = Signal(str)
+    rightClicked = Signal(str, QPoint)
+    copied = Signal(str)
+
+    # 語の高さに足される分: layout の上下 3+3 と QSS の枠 1+1
+    _BOX_EXTRA = 8
 
     def __init__(self, tag: str, parent=None):
         super().__init__(parent)
@@ -123,6 +138,10 @@ class TagChip(QWidget):
 
         self.label = QLabel(tag)
         self.label.setWordWrap(False)
+        # フォントメトリクスだけだと 18px まで潰れる環境がある（仕様はタグ 22〜26px）。
+        # 面の高さは theme.CHIP_HEIGHT で固定して、行の高さ計算 _chip_height() と揃える。
+        self.label.setMinimumHeight(theme.CHIP_HEIGHT - self._BOX_EXTRA)
+        self._update_tooltip()
 
         self._layout.addWidget(self.label)
 
@@ -133,10 +152,18 @@ class TagChip(QWidget):
             self.doubleClicked.emit(self.tag)
 
     def mousePressEvent(self, event) -> None:
+        if event.button() != Qt.LeftButton:
+            return
         if self._select_mode:
             self._selected = not self._selected
             self._update_style()
+        else:
+            self.copied.emit(self.tag)
         self.clicked.emit(self.tag)
+
+    def contextMenuEvent(self, event) -> None:
+        # PySide6 の QContextMenuEvent は globalPos() を公開（globalPosition() は無い）
+        self.rightClicked.emit(self.tag, event.globalPos())
 
     def set_tag(self, tag: str) -> None:
         self.tag = tag
@@ -146,7 +173,12 @@ class TagChip(QWidget):
         self._select_mode = enabled
         if not enabled:
             self._selected = False
+        self._update_tooltip()
         self._update_style()
+
+    def _update_tooltip(self) -> None:
+        action = "クリックで選択" if self._select_mode else "クリックでコピー"
+        self.setToolTip(f"{action}・右クリックで編集／コピー／検索")
 
     def is_selected(self) -> bool:
         return self._selected
@@ -158,28 +190,22 @@ class TagChip(QWidget):
 
     def _update_style(self) -> None:
         if self._selected:
-            bg = "#5a2020"
-            border = "#b84040"
-            text_color = "#ffaaaa"
+            bg, border, text_color = theme.DANGER_BG, theme.DANGER, theme.DANGER_TEXT
         elif self._is_lora_tag():
-            # LoRAタグ: 明るい緑色
-            bg = "#1a3a1a"
-            border = "#3a8a3a"
-            text_color = "#55dd55"
+            # LoRAタグ: OK色。面は暗く語だけ明るく（仕様③④の「地味・小型」）
+            bg, border, text_color = theme.OK_BG, theme.OK_BORDER, theme.OK
         else:
-            bg = "#1e2d3d"
-            border = "#3a5068"
-            text_color = "#c8dff0"
+            bg, border, text_color = theme.SURFACE_RAISED, theme.BORDER, theme.TEXT
         self.setStyleSheet(
             f"""
             TagChip {{
                 background: {bg};
                 border: 1px solid {border};
-                border-radius: 6px;
+                border-radius: {theme.RADIUS_CHIP}px;
             }}
             TagChip QLabel {{
                 color: {text_color};
-                font-size: 12px;
+                font-size: {theme.SMALL_SIZE + 1}px;
                 background: transparent;
                 border: none;
             }}
@@ -198,6 +224,8 @@ class TagEditorWidget(QWidget):
     """
     tagsChanged = Signal()
     selectionChanged = Signal(bool)  # 選択状態の有無が変わった時に発火
+    searchRequested = Signal(str)    # 右クリックメニュー「検索」: 語を親の検索欄へ渡す
+    tagCopied = Signal(str)          # クリック/メニューでのコピー完了。表示フィードバックは親側
 
     _CHIP_H_SPACING = 4
     _CHIP_V_SPACING = 4
@@ -214,7 +242,7 @@ class TagEditorWidget(QWidget):
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
 
         self.help_label = QLabel("タグ一覧")
-        self.help_label.setStyleSheet("color: #9fb2c7; padding: 0 2px 4px 2px;")
+        self.help_label.setStyleSheet(f"QLabel {{ {theme.heading()} padding: 0 2px 4px 2px; }}")
 
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
@@ -228,7 +256,7 @@ class TagEditorWidget(QWidget):
             "}"
             "QScrollArea > QWidget > QWidget { background: transparent; }"
             "QScrollBar:vertical { width: 6px; background: transparent; }"
-            "QScrollBar::handle:vertical { background: #2f5274; border-radius: 3px; }"
+            "QScrollBar::handle:vertical { background: " + theme.SURFACE_RAISED + "; border-radius: 3px; }"
             "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
         )
 
@@ -240,9 +268,9 @@ class TagEditorWidget(QWidget):
         self.border_frame.setObjectName("tagBorderFrame")
         self.border_frame.setStyleSheet(
             "#tagBorderFrame {"
-            " background: #121a27;"
-            f" border: {self._BORDER_WIDTH}px solid #2f5274;"
-            " border-radius: 8px;"
+            f" background: {theme.PANEL_MAIN};"
+            f" border: {self._BORDER_WIDTH}px solid {theme.BORDER};"
+            f" border-radius: {theme.RADIUS_PANEL}px;"
             "}"
         )
         border_layout = QVBoxLayout(self.border_frame)
@@ -265,7 +293,7 @@ class TagEditorWidget(QWidget):
 
         self.empty_label = QLabel("タグなし")
         self.empty_label.setAlignment(Qt.AlignCenter)
-        self.empty_label.setStyleSheet("color: #708090; background: transparent;")
+        self.empty_label.setStyleSheet(f"color: {theme.TEXT_MUTED}; background: transparent;")
         self.empty_label.setParent(self.scroll_area)
 
         outer = QVBoxLayout(self)
@@ -277,7 +305,7 @@ class TagEditorWidget(QWidget):
 
     def _chip_height(self) -> int:
         metrics = QFontMetrics(self.font())
-        return max(24, metrics.height() + self._AREA_PADDING * 2)
+        return max(theme.CHIP_HEIGHT, metrics.height() + self._AREA_PADDING * 2)
 
     def _area_height(self) -> int:
         ch = self._chip_height()
@@ -310,7 +338,9 @@ class TagEditorWidget(QWidget):
         overflow = len(tags) - self.MAX_CHIPS
         if overflow > 0:
             self._overflow_label = QLabel(f"...他 {overflow} タグ", self.flow_container)
-            self._overflow_label.setStyleSheet("color: #708090; font-size: 11px; background: transparent; border: none;")
+            self._overflow_label.setStyleSheet(
+                f"color: {theme.TEXT_MUTED}; font-size: {theme.SMALL_SIZE}px; background: transparent; border: none;"
+            )
             self.flow_layout.addWidget(self._overflow_label)
         self._refresh_empty_state()
         self.tagsChanged.emit()
@@ -328,14 +358,14 @@ class TagEditorWidget(QWidget):
     def set_delete_mode_border(self, active: bool) -> None:
         """削除モードに応じてタグエリアの枠線色を変更する"""
         if active:
-            border_color = "#b84040"
+            border_color = theme.DANGER
         else:
-            border_color = "#2f5274"
+            border_color = theme.BORDER
         self.border_frame.setStyleSheet(
             "#tagBorderFrame {"
-            " background: #121a27;"
+            f" background: {theme.PANEL_MAIN};"
             f" border: {self._BORDER_WIDTH}px solid {border_color};"
-            " border-radius: 8px;"
+            f" border-radius: {theme.RADIUS_PANEL}px;"
             "}"
         )
 
@@ -346,6 +376,8 @@ class TagEditorWidget(QWidget):
         chip = TagChip(clean)
         chip.doubleClicked.connect(self._edit_chip)
         chip.clicked.connect(self._on_chip_clicked)
+        chip.rightClicked.connect(self._show_chip_menu)
+        chip.copied.connect(self._on_chip_copied)
         self.flow_layout.addWidget(chip)
         self._chips.append(chip)
         self._tag_set.add(clean)
@@ -433,6 +465,23 @@ class TagEditorWidget(QWidget):
                 self._tag_set.add(updated)
                 break
         self.tagsChanged.emit()
+
+    def _show_chip_menu(self, tag: str, pos: QPoint) -> None:
+        menu = QMenu(self)
+        act_edit = menu.addAction("編集")
+        act_copy = menu.addAction("コピー")
+        act_search = menu.addAction("検索")
+        chosen = menu.exec(pos)
+        if chosen is act_edit:
+            self._edit_chip(tag)
+        elif chosen is act_copy:
+            self._on_chip_copied(tag)
+        elif chosen is act_search:
+            self.searchRequested.emit(tag)
+
+    def _on_chip_copied(self, tag: str) -> None:
+        copy_tag_to_clipboard(tag)
+        self.tagCopied.emit(tag)
 
     def has_selected_tags(self) -> bool:
         return any(chip.is_selected() for chip in self._chips)

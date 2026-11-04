@@ -1,18 +1,56 @@
 from __future__ import annotations
 
+import math
 import os
+import re
 import time
 from collections import OrderedDict
+from pathlib import Path, PurePosixPath
 
-from PySide6.QtCore import QAbstractListModel, QModelIndex, QRect, QRectF, QSize, Qt, QThreadPool, QTimer, Slot
+from PySide6.QtCore import QAbstractListModel, QModelIndex, QRect, QRectF, QSize, Qt, QThreadPool, QTimer, Slot, QObject, QPropertyAnimation, QEasingCurve, Property
 from PySide6.QtGui import QFont, QFontMetrics, QIcon, QImage, QPainter, QColor, QPainterPath, QPen, QPixmap, QTextLayout
 from PySide6.QtWidgets import QApplication, QStyle, QStyleOptionViewItem, QStyledItemDelegate
 
+from . import theme
 from .models import WildcardEntry
-from .thumbnail_workers import ThumbnailLoadSignals, ThumbnailLoadTask
+from .repository import build_thumbnail_gallery_index, thumbnail_folder_listing
+from .thumbnail_workers import (ThumbnailLoadSignals, ThumbnailLoadTask,
+                                decode_cover_image)
 
 CARD_FRAME_PADDING = 14
-CARD_ICON_RATIO = 1.5
+
+# 2枚目以降へめくるアニメーションの1回ぶん時間。短すぎると「切り替わった」
+# ことが読めず、長すぎると連続ダブルクリックが詰まる。
+FLIP_DURATION_MS = 340
+
+
+def rel_folder_of(rel_path: str) -> str:
+    """rel_path（POSIX）の親フォルダ。直下は "" に揃える（"" と "." の二表記防止）。"""
+    parent = PurePosixPath(rel_path).parent.as_posix()
+    return "" if parent == "." else parent
+
+
+def thumbnail_paths_equal(a, b) -> bool:
+    r"""サムネイル実パスが同一ファイルを指すかの判定。
+
+    Windows はパスの大小文字と区切り記号が違っても同じファイルなので、`==` や
+    `in` で素直に比べると重複として扱う。DB側は `H:\...`、スキャン側は設定由来の
+    `h:\...` になっており、実データで実際にズレた（1枚だけなのに `1/2` のピルが
+    出た）。枚数カウントと「表示中」マークはすべてこの関数で比べる。
+    """
+    if not a or not b:
+        return False
+    return os.path.normcase(str(a)) == os.path.normcase(str(b))
+
+# LoRA名の照合キーから不可視文字を落とすためのパターン。
+# ファイル名に BOM(U+FEFF) やゼロ幅スペースが混入した実体があると、小文字化するだけでは
+# 一致せず「LoRA削除済み」の誤判定になる（実測例: `﻿mai_cammysf2.safetensors`）。
+LORA_NAME_NOISE_RE = re.compile("[\ufeff\u200b\u200c\u200d\u2060\u200e\u200f]")
+
+
+def lora_name_key(raw: object) -> str:
+    """`<lora:x>` の名前とファイル名の突合に使う正規化キーを返す。"""
+    return LORA_NAME_NOISE_RE.sub("", str(raw or "")).strip().lower()
 
 # LoRA BaseModel → サムネイル左上バッジの表示名と背景色。
 # new_wildcard_dialog.LoraCardWidget._BASE_MODEL_COLORS と同系色を使う。
@@ -25,6 +63,12 @@ BASE_MODEL_BADGE_COLORS: dict[str, str] = {
     "anima": "#c243c2",
     "mix": "#e11d48",
 }
+# 参照LoRAがディスクから消えたカードの表示。サムネイルをモノクロ化して区別する。
+LOST_BADGE_LABEL = "LOST"
+LOST_BADGE_COLOR = theme.LOST
+# モノクロ化と同時にこれだけ沈める。1.0だと彩色だけ消えて亮度がそのまま残り、
+# 暗いカード背景(theme.CARD_BG)の上で「死んでる」ことが分かりにくい。
+LOST_CARD_DIM = 0.72
 
 
 def entry_base_badge(lora_names: list[str] | tuple[str, ...] | None,
@@ -38,7 +82,7 @@ def entry_base_badge(lora_names: list[str] | tuple[str, ...] | None,
         return None
     kinds: set[str] = set()
     for name in lora_names:
-        bm = (base_map.get(str(name).strip().lower()) or "").strip().lower()
+        bm = (base_map.get(lora_name_key(name)) or "").strip().lower()
         if bm in BASE_MODEL_BADGE_LABELS:
             kinds.add(bm)
     if kinds == {"illustrious"}:
@@ -48,6 +92,47 @@ def entry_base_badge(lora_names: list[str] | tuple[str, ...] | None,
     if kinds == {"illustrious", "anima"}:
         return ("mix", BASE_MODEL_BADGE_COLORS["mix"])
     return None
+
+
+def entry_lost_loras(lora_names: list[str] | tuple[str, ...] | None,
+                     lost_names: set[str] | None) -> list[str]:
+    """参照LoRAのうちディスク上に痕跡が無い（削除済み）名前を元の表記のまま返す。
+
+    lost_names は MainWindow が作る「ワイルドカードから参照されているのに、
+    重み・cm-info.json・civitai.info・metadata.json のどれにも対応ファイルが
+    存在しない名前」の集合（lower）。フォルダ付き参照 `<lora:sub/name>` にも
+    末尾名で一致する。
+    """
+    if not lora_names or not lost_names:
+        return []
+    missing: list[str] = []
+    for name in lora_names:
+        raw = str(name).strip()
+        key = lora_name_key(raw)
+        tail = key.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+        if key in lost_names or tail in lost_names:
+            missing.append(raw)
+    return missing
+
+
+def _make_monochrome_pixmap(pixmap: QPixmap, dim: float = LOST_CARD_DIM) -> QPixmap:
+    """サムネイルをグレースケール化して少し沈める（LOSTカード用）。
+
+    `QImage.Format_Grayscale8` 変換が輝度重みでのモノクロ化なので、色相を完全に
+    落としつつ明るさの対比は残る。従来は暗いオーバーレイを重ねる方式だったが、
+    カード背景もウィンドウ背景も暗いたま差分が見えなかった
+    （ユーザー指摘「グレーアウトが弱い。モノクロにして」）。
+    """
+    if pixmap.isNull():
+        return pixmap
+    gray = pixmap.toImage().convertToFormat(QImage.Format_Grayscale8)
+    result = QPixmap.fromImage(gray.convertToFormat(QImage.Format_ARGB32_Premultiplied))
+    painter = QPainter(result)
+    level = max(0, min(255, int(255 * dim)))
+    painter.setCompositionMode(QPainter.CompositionMode_Multiply)
+    painter.fillRect(result.rect(), QColor(level, level, level))
+    painter.end()
+    return result
 
 
 def _make_rounded_pixmap(pixmap: QPixmap, radius: int) -> QPixmap:
@@ -75,17 +160,62 @@ def _make_rounded_pixmap(pixmap: QPixmap, radius: int) -> QPixmap:
 CARD_TITLE_HEIGHT = 56
 
 
+def _fit_prefix(text: str, fm: QFontMetrics, width: int) -> int:
+    """幅に収まる最長prefixの長さ。直前の区切り記号は次の行へ回す（"foo_" で切らない）。"""
+    lo, hi = 1, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if fm.horizontalAdvance(text[:mid]) <= width:
+            lo = mid
+        else:
+            hi = mid - 1
+    while lo > 1 and text[lo - 1] in " _-.·":
+        lo -= 1
+    return lo
+
+
+def two_line_title(text: str, font: QFont, width: int) -> list[str]:
+    """カード标题を最大2行に折り返し、3行目以降は2行目の末尾を省略記号にする（仕様③）。
+    style の WrapText は高さを超えた行を「…」なしで切るため、折返しはここで決める。"""
+    if not text or width <= 0:
+        return [text] if text else []
+    fm = QFontMetrics(font)
+    if fm.horizontalAdvance(text) <= width:
+        return [text]
+    layout = QTextLayout(text, font)
+    layout.beginLayout()
+    spans: list[tuple[int, int]] = []
+    while len(spans) < 32:
+        line = layout.createLine()
+        if not line.isValid():
+            break
+        line.setLineWidth(width)
+        spans.append((line.textStart(), line.textLength()))
+    layout.endLayout()
+    lines = [text[s:s + n] for s, n in spans if n]
+    # 語で折り返せた（各行が幅に収まる）場合だけそれを信用する。
+    # 区切りの無い長い名前は QTextLayout が1行のまま溢出させるので文字単位で折る。
+    if lines and all(fm.horizontalAdvance(ln) <= width + 1 for ln in lines):
+        if len(lines) == 1:
+            return [fm.elidedText(text, Qt.ElideRight, width)]
+        rest = text[spans[1][0]:].lstrip(" _-.·")
+        return [lines[0], fm.elidedText(rest, Qt.ElideRight, width)]
+    first = _fit_prefix(text, fm, width)
+    rest = text[first:].lstrip(" _-.·")
+    return [text[:first], fm.elidedText(rest, Qt.ElideRight, width)]
+
+
 def render_placeholder_pixmap(thumbnail_size: int) -> QPixmap:
     width = max(80, thumbnail_size)
-    height = int(width * 1.5)
+    height = int(width * theme.CARD_ICON_RATIO)
     pixmap = QPixmap(width, height)
-    pixmap.fill(QColor("#111317"))
+    pixmap.fill(QColor(theme.APP_BG))
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.Antialiasing)
     painter.setPen(Qt.NoPen)
-    painter.setBrush(QColor("#232a31"))
-    painter.drawRoundedRect(4, 4, width - 8, height - 8, 14, 14)
-    painter.setPen(QPen(QColor("#75808a")))
+    painter.setBrush(QColor(theme.PANEL_SIDE))
+    painter.drawRoundedRect(4, 4, width - 8, height - 8, theme.RADIUS_CARD, theme.RADIUS_CARD)
+    painter.setPen(QPen(QColor(theme.TEXT_MUTED)))
     font = painter.font()
     font.setPointSize(max(8, min(14, width // 10)))
     font.setBold(True)
@@ -124,6 +254,70 @@ def wrap_text_lines(text: str, metrics: QFontMetrics, width: int, max_lines: int
     return lines
 
 
+class CardFlip(QObject):
+    """カードを「裏返して」次の枚へ切り替える1回ぶんの進行。
+
+    横縮みを |cos(pi t)| にすると縦軸まわり回転の横からの射影そのものになる。
+    t<0.5 で旧画像、t>=0.5 で新画像を描き、中間に影を乗せて裏返った面の
+    暗さを演出する。
+    """
+
+    def __init__(self, model: "ThumbnailListModel", rel_path: str,
+                 outgoing: QPixmap, incoming: QImage):
+        super().__init__(model)
+        self.rel_path = rel_path
+        self.outgoing = outgoing
+        self.incoming = incoming
+        self.incoming_pixmap = QPixmap.fromImage(incoming)
+        self._progress = 0.0
+        self._anim = QPropertyAnimation(self, b"progress", self)
+        self._anim.setDuration(FLIP_DURATION_MS)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(1.0)
+        self._anim.setEasingCurve(QEasingCurve.InOutSine)
+        self._anim.valueChanged.connect(self._on_value)
+        self._anim.finished.connect(self._on_done)
+
+    @Property(float)
+    def progress(self) -> float:
+        return self._progress
+
+    @progress.setter
+    def progress(self, value: float) -> None:
+        self._progress = float(value)
+
+    def start(self) -> None:
+        self._anim.start()
+
+    def _on_value(self, _value) -> None:
+        model = self.parent()
+        if isinstance(model, ThumbnailListModel):
+            model.repaint_flip(self.rel_path)
+
+    def _on_done(self) -> None:
+        model = self.parent()
+        if isinstance(model, ThumbnailListModel):
+            model.finish_flip(self.rel_path)
+
+    def pixmap_for(self, size: QSize) -> QPixmap | None:
+        t = self._progress
+        squeeze = max(0.06, abs(math.cos(math.pi * t)))
+        source = self.outgoing if t < 0.5 else self.incoming_pixmap
+        if source.isNull():
+            return None
+        width = max(1, int(size.width() * squeeze))
+        scaled = source.scaled(width, size.height(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        frame = QPixmap(scaled.width(), scaled.height())
+        frame.fill(Qt.transparent)
+        painter = QPainter(frame)
+        painter.drawPixmap(0, 0, scaled)
+        shade = int(120 * math.sin(math.pi * t))
+        if shade:
+            painter.fillRect(frame.rect(), QColor(0, 0, 0, shade))
+        painter.end()
+        return frame
+
+
 class ThumbnailListModel(QAbstractListModel):
     # 読み込み失敗後、自動で再試行するまでの最短間隔（連続リペイントでの
     # 再試行スパムを防ぐ）。F5（set_entries の明示的呼び出し）はこの
@@ -140,6 +334,9 @@ class ThumbnailListModel(QAbstractListModel):
         # LoRA名(lower) → BaseModel のマップ（MainWindow から設定される）。
         # サムネイル左上の ill/ani バッジ描画に使う。
         self.lora_base_model_map: dict[str, str] = {}
+        # ワイルドカードから参照されているのに実体が無いLoRA名（lower）の集合
+        # （MainWindow から設定される）。含まれる名前を参照するカードは LOST 表示。
+        self.lost_lora_names: set[str] = set()
         # icon_cache には「読み込みに成功したサムネイル」だけを保持する。
         # 失敗結果はここに入れない（失敗の永久キャッシュを防ぐ）。
         # 【方針B】キーは (rel_path, thumbnail_size)。rel_path は環境非依存
@@ -172,6 +369,17 @@ class ThumbnailListModel(QAbstractListModel):
         self.thread_pool.setMaxThreadCount(min(8, os.cpu_count() or 8))
         self.loader_signals = ThumbnailLoadSignals(self)
         self.loader_signals.loaded.connect(self._handle_loaded_thumbnail)
+        # --- 2枚目以降（カードめくり）状態 ---
+        # rel_path → 表示中の枚目（0起点）。カードの選択とは独立して保持する。
+        self.variant_index: dict[str, int] = {}
+        # rel_path → 実パス列（1枚目→2枚目以降）/ folder → stem索引。
+        # 走査は「めくった・複数枚のカードが存在するフォルダ」だけ。
+        self._gallery_cache: dict[str, list[str]] = {}
+        self._folder_index: dict[str, dict[str, list[str]]] = {}
+        # MainWindow から注入される（サムネルートと、フォルダ一覧の取得関数）
+        self.thumbnail_root: Path | None = None
+        self.gallery_listing_provider = None  # relフォルダ -> list[str]
+        self.flips: dict[str, CardFlip] = {}
 
     def set_entries(self, entries: list[WildcardEntry]) -> None:
         # 【方針B】リスト同一性判定・row_by_path 構築ともに rel_path をキーに使う。
@@ -239,6 +447,10 @@ class ThumbnailListModel(QAbstractListModel):
         for key in list(self._load_tokens.keys()):
             if key[0] not in protected_set:
                 self._load_tokens[key] = self._load_tokens[key] + 1
+        # F5 は「エクスプローラー側でサムネイルを増減した」後の再評価にも使うので、
+        # 2枚目以降のフォルダ一覧も組み直す（枚ずれ防止）
+        self._folder_index.clear()
+        self._gallery_cache.clear()
         if self.entries:
             first = self.index(0, 0)
             last = self.index(len(self.entries) - 1, 0)
@@ -328,6 +540,122 @@ class ThumbnailListModel(QAbstractListModel):
             index = self.index(row, 0)
             self.dataChanged.emit(index, index, [Qt.DecorationRole])
 
+    # ── 2枚目以降（カードめくり） ────────────────────────────────
+
+    def gallery_paths(self, entry: WildcardEntry) -> list[str]:
+        """このカードのサムネイル実パス列（1枚目→2枚目以降）。フォルダ単位で索引化。
+
+        1フォルダ1回の scandir + 1回の分類で全カードに使い回すので、可視カードが
+        多くても描画ごとに走査はしない。DBが解決した1枚目は必ず先頭に置く
+        （F5直後に枚ずれしない為）。
+        """
+        cached = self._gallery_cache.get(entry.rel_path)
+        if cached is not None:
+            return cached
+        root = self.thumbnail_root
+        paths: list[str] = []
+        if root is not None:
+            folder = rel_folder_of(entry.rel_path)
+            index = self._folder_index.get(folder)
+            if index is None:
+                if self.gallery_listing_provider is not None:
+                    try:
+                        names = self.gallery_listing_provider(folder)
+                    except Exception:
+                        names = []
+                else:
+                    names = thumbnail_folder_listing(root, entry.rel_path)
+                index = build_thumbnail_gallery_index(names)
+                self._folder_index[folder] = index
+            base = root if not folder else root / folder
+            paths = [str(base / name) for name in index.get(entry.stem, [])]
+        if entry.thumbnail_path and not any(thumbnail_paths_equal(entry.thumbnail_path, p) for p in paths):
+            paths.insert(0, entry.thumbnail_path)
+        self._gallery_cache[entry.rel_path] = paths
+        return paths
+
+    def invalidate_gallery(self, rel_path: str) -> None:
+        self._gallery_cache.pop(rel_path, None)
+        folder = rel_folder_of(rel_path)
+        self._folder_index.pop(folder, None)
+        for cached_rel in list(self._gallery_cache.keys()):
+            if rel_folder_of(cached_rel) == folder:
+                self._gallery_cache.pop(cached_rel, None)
+
+    def variant_count(self, entry: WildcardEntry) -> int:
+        return len(self.gallery_paths(entry))
+
+    def current_variant(self, entry: WildcardEntry) -> int:
+        return self.variant_index.get(entry.rel_path, 0)
+
+    def display_path_for(self, entry: WildcardEntry) -> str | None:
+        """表示・ロード対象の実パス。枚目が0でDBの1枚目があるなら走査しない（高速路）。"""
+        index = self.variant_index.get(entry.rel_path, 0)
+        if index == 0 and entry.thumbnail_path:
+            return entry.thumbnail_path
+        paths = self.gallery_paths(entry)
+        if not paths:
+            return entry.thumbnail_path or None
+        return paths[min(index, len(paths) - 1)]
+
+    def flip_to_next(self, entry: WildcardEntry) -> int | None:
+        """次の枚へめくる。成功したら 1起点 の枚目を返す（枚数が足りないなら None）。"""
+        paths = self.gallery_paths(entry)
+        if len(paths) < 2:
+            return None
+        rel_path = entry.rel_path
+        current = self.variant_index.get(rel_path, 0)
+        nxt = (current + 1) % len(paths)
+        target = paths[nxt]
+        width = max(80, self.thumbnail_size)
+        height = int(width * theme.CARD_ICON_RATIO)
+        incoming = decode_cover_image(target, width, height)
+        if incoming.isNull():
+            return None
+        cached = self.icon_cache.get((rel_path, self.thumbnail_size))
+        outgoing = cached.pixmap(QSize(width, height)) if cached is not None else QPixmap()
+        if outgoing.isNull():
+            outgoing = self._get_placeholder_icon().pixmap(QSize(width, height))
+        self.variant_index[rel_path] = nxt
+        flip = CardFlip(self, rel_path, outgoing, incoming)
+        self.flips[rel_path] = flip
+        flip.start()
+        self.repaint_flip(rel_path)
+        return nxt + 1
+
+    def repaint_flip(self, rel_path: str) -> None:
+        row = self.row_by_path.get(rel_path)
+        if row is None or row >= len(self.entries):
+            return
+        index = self.index(row, 0)
+        self.dataChanged.emit(index, index, [Qt.DecorationRole])
+
+    def finish_flip(self, rel_path: str) -> None:
+        flip = self.flips.pop(rel_path, None)
+        if flip is None:
+            return
+        self.set_icon_directly(rel_path, flip.incoming)
+
+    def reset_variant(self, rel_path: str) -> None:
+        """サムネイル削除/追加時など、枚数の前提が変わったときの初期化。"""
+        self.variant_index.pop(rel_path, None)
+        self.invalidate_gallery(rel_path)
+
+    def forget_thumbnail(self, rel_path: str) -> None:
+        """キャッシュ・枚数・フォルダ一覧を全部忘れて再ロードさせる。
+
+        `clear_cache_for_path` は set_icon_directly 後の3秒間保護に弾かれるため、
+        「生成直後にめくった→すぐ削除」の順でも旧画像が残る。削除では保護を
+        無視して確実に忘れる必要がある。
+        """
+        self._protected_paths.pop(rel_path, None)
+        self.reset_variant(rel_path)
+        self.clear_cache_for_path(rel_path)
+        row = self.row_by_path.get(rel_path)
+        if row is not None and row < len(self.entries):
+            index = self.index(row, 0)
+            self.dataChanged.emit(index, index, [Qt.DecorationRole])
+
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         return 0 if parent.isValid() else len(self.entries)
 
@@ -341,10 +669,15 @@ class ThumbnailListModel(QAbstractListModel):
             return self._get_icon(entry)
         if role == Qt.SizeHintRole:
             width = max(80, self.thumbnail_size) + CARD_FRAME_PADDING
-            height = int(max(80, self.thumbnail_size) * CARD_ICON_RATIO) + CARD_TITLE_HEIGHT + CARD_FRAME_PADDING
+            height = int(max(80, self.thumbnail_size) * theme.CARD_ICON_RATIO) + CARD_TITLE_HEIGHT + CARD_FRAME_PADDING
             return QSize(width, height)
         if role == Qt.UserRole:
             return entry.abs_path
+        if role == Qt.ToolTipRole:
+            missing = entry_lost_loras(entry.lora_names, self.lost_lora_names)
+            if missing:
+                return "LoRAが見つかりません（削除済み）:\n" + "\n".join(missing)
+            return None
         return None
 
     def entry_at(self, index: QModelIndex) -> WildcardEntry | None:
@@ -371,7 +704,10 @@ class ThumbnailListModel(QAbstractListModel):
         key = (entry.rel_path, self.thumbnail_size)
         if key in self.icon_cache or key in self.pending_loads:
             return
-        if not entry.thumbnail_path or not entry.has_thumbnail:
+        # 表示対象は枚目（variant）込みで解決する。1枚目だけなら DB のパスを
+        # そのまま使うので、従来動作（と速さ）は変わらない。
+        thumbnail_path = self.display_path_for(entry)
+        if not thumbnail_path:
             return
         if not force and key in self.failed_keys:
             last = self._last_attempt.get(key, 0.0)
@@ -386,7 +722,7 @@ class ThumbnailListModel(QAbstractListModel):
         token = self._load_tokens.get(key, 0) + 1
         self._load_tokens[key] = token
         self.thread_pool.start(
-            ThumbnailLoadTask(entry.rel_path, entry.thumbnail_path, self.thumbnail_size, token, self.loader_signals),
+            ThumbnailLoadTask(entry.rel_path, thumbnail_path, self.thumbnail_size, token, self.loader_signals),
             priority,
         )
 
@@ -520,16 +856,16 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
             top += line_height
 
         if option.state & QStyle.State_Selected:
-            painter.setPen(QPen(QColor("white"), 4))
+            painter.setPen(QPen(QColor(theme.ACCENT), 2))
             painter.setBrush(Qt.NoBrush)
-            painter.drawRoundedRect(rect, 12, 12)
+            painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), theme.RADIUS_CARD - 1, theme.RADIUS_CARD - 1)
         painter.restore()
 
 
 class ThumbnailCardDelegate(QStyledItemDelegate):
     def _card_metrics(self, index: QModelIndex) -> tuple[int, int, int]:
         thumb_width = max(80, int(getattr(index.model(), "thumbnail_size", 260)))
-        thumb_height = int(thumb_width * CARD_ICON_RATIO)
+        thumb_height = int(thumb_width * theme.CARD_ICON_RATIO)
         return thumb_width, thumb_height, CARD_TITLE_HEIGHT
 
     def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:
@@ -546,37 +882,83 @@ class ThumbnailCardDelegate(QStyledItemDelegate):
         is_hovered = bool(option.state & QStyle.State_MouseOver)
 
         painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor("#2a3a50") if is_hovered else QColor("#171b21"))
-        painter.drawRoundedRect(rect, 14, 14)
+        painter.setBrush(QColor(theme.HOVER_BG) if is_hovered else QColor(theme.CARD_BG))
+        painter.drawRoundedRect(rect, theme.RADIUS_CARD, theme.RADIUS_CARD)
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
         opt.state = opt.state & ~QStyle.State_Selected & ~QStyle.State_MouseOver
         opt.rect = rect.adjusted(12, 12, -12, -12)
+        title_text = opt.text
+        # 标题は self で2行省略描画する（style の WrapText は高さ超過行を「…」なしで切る）
+        opt.text = ""
         opt.decorationPosition = QStyleOptionViewItem.Top
         opt.decorationAlignment = Qt.AlignHCenter
-        opt.displayAlignment = Qt.AlignHCenter | Qt.AlignTop
-        opt.textElideMode = Qt.ElideRight
-        opt.features |= QStyleOptionViewItem.WrapText
         opt.decorationSize = QSize(thumb_width, thumb_height)
+        model = index.model()
+        try:
+            entry = model.entry_at(index)
+        except Exception:
+            entry = None
+        try:
+            missing = entry_lost_loras(entry.lora_names if entry is not None else None,
+                                       getattr(model, "lost_lora_names", None))
+        except Exception:
+            missing = []
         style = option.widget.style() if option.widget is not None else QApplication.style()
         # ユーザー作業分: style.drawControl に渡す前にアイコンへ角丸を適用する。
         # drawControl 呼び出し後に painter.setClipPath() しても style 内部の
         # save()/restore() で clip が巻き戻されるため、ここで pixmap を加工する。
-        if not opt.icon.isNull():
+        if entry is not None:
+            try:
+                flip = model.flips.get(entry.rel_path)
+            except Exception:
+                flip = None
+        else:
+            flip = None
+        if flip is not None:
+            frame = flip.pixmap_for(opt.decorationSize)
+            if frame is not None and not frame.isNull():
+                opt.icon = QIcon(_make_rounded_pixmap(frame, 10))
+        elif not opt.icon.isNull():
             pix = opt.icon.pixmap(opt.decorationSize)
             if not pix.isNull():
+                if missing:
+                    pix = _make_monochrome_pixmap(pix)
                 opt.icon = QIcon(_make_rounded_pixmap(pix, 10))
         style.drawControl(QStyle.CE_ItemViewItem, opt, painter, option.widget)
 
-        if is_selected:
-            painter.setPen(QPen(QColor("white"), 4))
-            painter.setBrush(Qt.NoBrush)
-            painter.drawRoundedRect(rect, 12, 12)
+        if title_text:
+            title_font = QFont(painter.font())
+            title_font.setPixelSize(theme.FONT_SIZE)
+            painter.setFont(title_font)
+            fm = QFontMetrics(title_font)
+            line_h = fm.height() + 2
+            title_rect = QRect(
+                opt.rect.left(),
+                opt.rect.top() + thumb_height + 2,
+                opt.rect.width(),
+                title_height - 4,
+            )
+            lines = two_line_title(title_text, title_font, title_rect.width())
+            y = title_rect.top() + max(0, (title_rect.height() - line_h * len(lines)) // 2)
+            painter.setPen(QColor(theme.TEXT))
+            for line in lines:
+                painter.drawText(
+                    QRect(title_rect.left(), y, title_rect.width(), line_h),
+                    Qt.AlignHCenter | Qt.AlignTop,
+                    line,
+                )
+                y += line_h
 
-        model = index.model()
+        if is_selected:
+            # 選択はアクセントの青アウトライン（仕様③）。旧来は白4pxでカード面を潰していた
+            painter.setPen(QPen(QColor(theme.ACCENT), 2))
+            painter.setBrush(Qt.NoBrush)
+            inset = QRectF(rect.adjusted(1, 1, -1, -1))
+            painter.drawRoundedRect(inset, theme.RADIUS_CARD - 1, theme.RADIUS_CARD - 1)
+
         # サムネイル左上の ill/ani バッジ描画
         try:
-            entry = model.entry_at(index)
             base_map = getattr(model, "lora_base_model_map", None)
             badge = entry_base_badge(entry.lora_names if entry is not None else None, base_map)
         except Exception:
@@ -585,20 +967,70 @@ class ThumbnailCardDelegate(QStyledItemDelegate):
             badge_text, badge_color = badge
             badge_font = QFont(painter.font())
             badge_font.setBold(True)
-            badge_font.setPixelSize(max(10, min(13, rect.width() // 14)))
+            badge_font.setPixelSize(max(9, min(11, rect.width() // 16)))
             painter.setFont(badge_font)
             badge_fm = QFontMetrics(badge_font)
-            badge_h = 18
-            badge_pad_x = 7
+            badge_h = 16
+            badge_pad_x = 5
             badge_w = badge_fm.horizontalAdvance(badge_text) + badge_pad_x * 2
             badge_rect = QRect(rect.left() + 6, rect.top() + 6, badge_w, badge_h)
             badge_bg = QColor(badge_color)
-            badge_bg.setAlpha(215)
-            painter.setPen(QPen(QColor("#10141a"), 1))
+            badge_bg.setAlpha(190)
+            painter.setPen(QPen(QColor(theme.APP_BG), 1))
             painter.setBrush(badge_bg)
-            painter.drawRoundedRect(badge_rect, 5, 5)
-            painter.setPen(QColor("white"))
+            painter.drawRoundedRect(badge_rect, 4, 4)
+            painter.setPen(QColor(theme.TEXT))
             painter.drawText(badge_rect, Qt.AlignCenter, badge_text)
+        # 2枚以上持つカードは右下に「2/3」の枚数ピル。めくれるカードが
+        # どれか一目で分からないと、ダブルクリックでめくれること自体が
+        # 発見できない（おまけの機能は存在が見えて初めて使われる）。
+        try:
+            pages = model.variant_count(entry) if entry is not None else 0
+        except Exception:
+            pages = 0
+        if pages >= 2:
+            page_font = QFont(painter.font())
+            page_font.setBold(True)
+            page_font.setPixelSize(max(9, min(11, rect.width() // 16)))
+            painter.setFont(page_font)
+            page_fm = QFontMetrics(page_font)
+            shown = min(model.current_variant(entry) + 1, pages)
+            page_text = f"{shown}/{pages}"
+            page_w = page_fm.horizontalAdvance(page_text) + 12
+            page_h = 16
+            thumb_bottom = opt.rect.top() + thumb_height
+            page_rect = QRect(opt.rect.right() - page_w - 6,
+                              max(opt.rect.top() + 6, thumb_bottom - page_h - 6),
+                              page_w, page_h)
+            page_bg = QColor(theme.APP_BG)
+            page_bg.setAlpha(215)
+            painter.setPen(QPen(QColor(theme.BORDER), 1))
+            painter.setBrush(page_bg)
+            painter.drawRoundedRect(page_rect, 4, 4)
+            painter.setPen(QColor(theme.TEXT_MUTED))
+            painter.drawText(page_rect, Qt.AlignCenter, page_text)
+        # 削除済みLoRA参照のカード: 減光は上のモノクロ化で済んでいるので、ここでは
+        # サムネイル左下に LOST ピルを置く（左上=ill/aniバッジ、右上=お気に入り星と
+        # 重なりにくい位置）
+        if missing:
+            lost_font = QFont(painter.font())
+            lost_font.setBold(True)
+            lost_font.setPixelSize(max(9, min(11, rect.width() // 16)))
+            painter.setFont(lost_font)
+            lost_fm = QFontMetrics(lost_font)
+            lost_h = 16
+            lost_w = lost_fm.horizontalAdvance(LOST_BADGE_LABEL) + 12
+            thumb_bottom = opt.rect.top() + thumb_height
+            lost_rect = QRect(opt.rect.left() + 6,
+                              max(opt.rect.top() + 6, thumb_bottom - lost_h - 6),
+                              lost_w, lost_h)
+            lost_bg = QColor(LOST_BADGE_COLOR)
+            lost_bg.setAlpha(210)
+            painter.setPen(QPen(QColor(theme.APP_BG), 1))
+            painter.setBrush(lost_bg)
+            painter.drawRoundedRect(lost_rect, 4, 4)
+            painter.setPen(QColor(theme.APP_BG))
+            painter.drawText(lost_rect, Qt.AlignCenter, LOST_BADGE_LABEL)
         # お気に入り星マークの描画
         abs_path = index.data(Qt.UserRole)
         favorite_paths: set[str] | None = getattr(model, "favorite_paths", None)
@@ -608,18 +1040,18 @@ class ThumbnailCardDelegate(QStyledItemDelegate):
             star_y = rect.top() + 6
             star_rect = QRect(star_x, star_y, star_size, star_size)
             # 影（可読性向上）
-            painter.setPen(QPen(QColor("#00000088"), 1))
-            painter.setBrush(QColor("#00000044"))
+            painter.setPen(QPen(QColor(theme.SHADOW), 1))
+            painter.setBrush(QColor(theme.SHADOW_SOFT))
             painter.drawEllipse(star_rect.adjusted(1, 1, 1, 1))
             # 星の円形バッジ
             painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor("#1a1a2e"))
+            painter.setBrush(QColor(theme.PANEL_MAIN))
             painter.drawEllipse(star_rect)
             # 星テキスト
             star_font = painter.font()
             star_font.setPixelSize(max(10, star_size - 3))
             painter.setFont(star_font)
-            painter.setPen(QColor("#FFD700"))
+            painter.setPen(QColor(theme.FAVORITE))
             painter.drawText(star_rect, Qt.AlignCenter, "★")
 
         painter.restore()

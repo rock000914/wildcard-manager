@@ -13,28 +13,20 @@ from PySide6.QtWidgets import (
     QSizePolicy,
 )
 
+from . import theme
 from .api import ThumbnailApiClient
 from .models import AppSettings, WildcardEntry
 from .repository import WildcardRepository
 from .single_thumbnail_worker import SingleThumbnailWorker
-from .tag_editor import FlowLayout, TagEditorWidget as _BaseTagEditorWidget
+from .tag_editor import FlowLayout, TagEditorWidget
 
 # サムネイル生成時の一時プレビューディレクトリ名
 PREVIEW_THUMB_SUBDIR = "_preview_thumbs"
 
-
-class TagEditorWidget(_BaseTagEditorWidget):
-    """タグクリック時にシグナルを発行するTagEditorWidget"""
-    tagClicked = Signal(str)
-
-    def _on_chip_clicked(self, tag: str) -> None:
-        self.tagClicked.emit(tag)
-        super()._on_chip_clicked(tag)
-
-    def _append_tag(self, tag: str) -> None:
-        super()._append_tag(tag)
-        if self._chips:
-            self._chips[-1].setToolTip("シングルクリックでコピー")
+# 外側寸法。QSS の min/max-height は content 寸法（枠1px*2を引く前）なので、
+# setFixedHeight に同じ値を渡すと2px短いボタンになる。ここは常に外側で揃える。
+UI_BUTTON_OUTER_HEIGHT = theme.BUTTON_HEIGHT        # 36
+UI_CONTROL_OUTER_HEIGHT = theme.INPUT_HEIGHT        # 36
 
 
 class _FolderPicker(QWidget):
@@ -44,12 +36,12 @@ class _FolderPicker(QWidget):
         super().__init__(parent)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
+        layout.setSpacing(theme.GAP_PAIR)
         self._edit = QLineEdit()
-        self._edit.setFixedHeight(34)
+        self._edit.setFixedHeight(UI_CONTROL_OUTER_HEIGHT)
         layout.addWidget(self._edit, 1)
         self._btn = QPushButton("参照")
-        self._btn.setFixedHeight(34)
+        self._btn.setFixedHeight(UI_BUTTON_OUTER_HEIGHT)
         self._btn.setMinimumWidth(50)
         layout.addWidget(self._btn)
         self._btn.clicked.connect(self._browse)
@@ -187,10 +179,10 @@ class LoraCardWidget(QWidget):
         # 対になる save() を先に呼ぶ（B3 修正）。
         p.save()
 
-        bg = QColor("#2a3a50") if self._hovered else QColor("#171b21")
+        bg = QColor(theme.HOVER_BG) if self._hovered else QColor(theme.CARD_BG)
         p.setBrush(bg)
-        p.setPen(QPen(QColor("#2a3440"), 1))
-        p.drawRoundedRect(0, 0, self.CARD_W, self.CARD_H, 8, 8)
+        p.setPen(QPen(QColor(theme.BORDER), 1))
+        p.drawRoundedRect(0, 0, self.CARD_W, self.CARD_H, theme.RADIUS_CARD, theme.RADIUS_CARD)
 
         thumb_rect = QRect(5, 5, self.THUMB_SIZE, self.THUMB_SIZE)
         preview = self.item_data.get("preview")
@@ -203,15 +195,15 @@ class LoraCardWidget(QWidget):
             y = thumb_rect.y() + (self.THUMB_SIZE - px.height()) // 2
             p.drawPixmap(x, y, px)
         else:
-            p.setBrush(QColor("#1a2030"))
-            p.setPen(QPen(QColor("#2a3440"), 1))
+            p.setBrush(QColor(theme.PANEL_SIDE))
+            p.setPen(QPen(QColor(theme.BORDER), 1))
             p.drawRoundedRect(thumb_rect, 6, 6)
-            p.setPen(QColor("#6a7a8a"))
+            p.setPen(QColor(theme.TEXT_MUTED))
             p.setFont(QFont("Yu Gothic UI", 9))
             p.drawText(thumb_rect, Qt.AlignCenter, "No img")
 
         name = self.item_data.get("name", "")
-        p.setPen(QColor("#edf2f7"))
+        p.setPen(QColor(theme.TEXT))
         p.setFont(QFont("Yu Gothic UI", 9))
         name_rect = QRect(0, self.THUMB_SIZE + 6, self.CARD_W, 20)
         elided = p.fontMetrics().elidedText(name, Qt.ElideRight, self.CARD_W - 8)
@@ -221,18 +213,18 @@ class LoraCardWidget(QWidget):
         base_model = str(self.item_data.get("base_model", "") or "Unknown").strip() or "Unknown"
         p.setFont(QFont("Yu Gothic UI", 8, QFont.Bold))
         fm = p.fontMetrics()
-        badge_h = 18
-        pad_x = 7
+        badge_h = 16
+        pad_x = 5
         w = fm.horizontalAdvance(base_model) + pad_x * 2
         rect = QRect(8, 8, w, badge_h)
         bg = QColor(self.base_model_color(base_model))
-        bg.setAlpha(175)
+        bg.setAlpha(190)
         p.setBrush(bg)
-        border = QColor("#1a2a40")
+        border = QColor(theme.APP_BG)
         border.setAlpha(175)
         p.setPen(QPen(border, 1))
-        p.drawRoundedRect(rect, 5, 5)
-        p.setPen(QColor("white"))
+        p.drawRoundedRect(rect, 4, 4)
+        p.setPen(QColor(theme.TEXT))
         p.drawText(rect, Qt.AlignCenter, base_model)
 
         p.restore()
@@ -320,17 +312,15 @@ class UnmadeLoraGridWidget(QWidget):
         folder_row.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         fr = QHBoxLayout(folder_row)
         fr.setContentsMargins(0, 0, 0, 0)
-        fr.setSpacing(4)
+        fr.setSpacing(theme.GAP_PAIR)
         fr.addWidget(QLabel("LoRA:"), 0)
         self._folder_picker = _FolderPicker()
-        self._folder_picker._edit.setFixedHeight(28)
-        self._folder_picker._btn.setFixedHeight(28)
         self._folder_picker._btn.setMinimumWidth(40)
         if self._lora_root:
             self._folder_picker.setText(Path(self._lora_root).as_posix())
         fr.addWidget(self._folder_picker, 1)
         self._btn_rescan = QPushButton("再読込")
-        self._btn_rescan.setFixedHeight(28)
+        self._btn_rescan.setFixedHeight(UI_BUTTON_OUTER_HEIGHT)
         self._btn_rescan.setMinimumWidth(56)
         self._btn_rescan.clicked.connect(self._rescan_folder)
         fr.addWidget(self._btn_rescan, 0)
@@ -341,7 +331,7 @@ class UnmadeLoraGridWidget(QWidget):
         self._sort_combo.addItem("追加日（新しい順）", "added_desc")
         self._sort_combo.addItem("更新日（新しい順）", "modified_desc")
         self._sort_combo.addItem("フォルダ順", "folder")
-        self._sort_combo.setFixedHeight(30)
+        self._sort_combo.setFixedHeight(UI_CONTROL_OUTER_HEIGHT)
         self._sort_combo.currentIndexChanged.connect(self._apply_sort)
         # 前回のソートモードを復元
         idx = self._sort_combo.findData(self._initial_sort_mode)
@@ -357,7 +347,7 @@ class UnmadeLoraGridWidget(QWidget):
 
         self._search = QLineEdit()
         self._search.setPlaceholderText("LoRAを検索...")
-        self._search.setFixedHeight(30)
+        self._search.setFixedHeight(UI_CONTROL_OUTER_HEIGHT)
         self._search.textChanged.connect(self._apply_filter)
         layout.addWidget(self._search)
         _setup_japanese_context_menu(self._search)
@@ -373,7 +363,7 @@ class UnmadeLoraGridWidget(QWidget):
         self._model_combo.addItem("Flux.1 D", "flux.1 d")
         self._model_combo.addItem("Other", "other")
         self._model_combo.addItem("Unknown", "unknown")
-        self._model_combo.setFixedHeight(30)
+        self._model_combo.setFixedHeight(UI_CONTROL_OUTER_HEIGHT)
         self._model_combo.currentIndexChanged.connect(self._apply_filter)
         layout.addWidget(self._model_combo)
 
@@ -382,8 +372,8 @@ class UnmadeLoraGridWidget(QWidget):
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._scroll.setStyleSheet(
             "QScrollArea{background:transparent;border:none}"
-            "QScrollBar:vertical{background:#0f1216;width:8px}"
-            "QScrollBar::handle:vertical{background:#2a3440;border-radius:4px;min-height:30px}"
+            f"QScrollBar:vertical{{background:{theme.APP_BG};width:8px}}"
+            f"QScrollBar::handle:vertical{{background:{theme.SURFACE_RAISED};border-radius:4px;min-height:30px}}"
             "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0}"
         )
         self._grid_widget = QWidget()
@@ -627,7 +617,7 @@ class CharacterTabContent(QWidget):
         hg.addWidget(QLabel("カード名:"), 0, 0)
         self.inp_name = QLineEdit()
         self.inp_name.setPlaceholderText("例: Alice")
-        self.inp_name.setFixedHeight(34)
+        self.inp_name.setFixedHeight(UI_CONTROL_OUTER_HEIGHT)
         hg.addWidget(self.inp_name, 0, 1)
 
         hg.addWidget(QLabel("保存先:"), 0, 2)
@@ -685,17 +675,17 @@ class CharacterTabContent(QWidget):
         btns = QWidget()
         btns_l = QHBoxLayout(btns)
         btns_l.setContentsMargins(0, 0, 0, 0)
-        btns_l.setSpacing(6)
+        btns_l.setSpacing(theme.GAP_PAIR)
         self.btn_merge = QPushButton("結合")
-        self.btn_merge.setFixedHeight(34)
+        self.btn_merge.setFixedHeight(UI_BUTTON_OUTER_HEIGHT)
         self.btn_merge.clicked.connect(self._on_merge)
         btns_l.addWidget(self.btn_merge)
         self.btn_merge_all = QPushButton("すべて結合")
-        self.btn_merge_all.setFixedHeight(34)
+        self.btn_merge_all.setFixedHeight(UI_BUTTON_OUTER_HEIGHT)
         self.btn_merge_all.clicked.connect(self._merge_all)
         btns_l.addWidget(self.btn_merge_all)
         self.btn_expand_merge = QPushButton("展開結合")
-        self.btn_expand_merge.setFixedHeight(34)
+        self.btn_expand_merge.setFixedHeight(UI_BUTTON_OUTER_HEIGHT)
         self.btn_expand_merge.clicked.connect(self._expand_merge)
         self.btn_expand_merge.setToolTip("展開結合には2つ以上のカードが必要です")
         btns_l.addWidget(self.btn_expand_merge)
@@ -704,13 +694,13 @@ class CharacterTabContent(QWidget):
         # 衣装追加/削除ボタン
         costume_btn_row = QHBoxLayout()
         costume_btn_row.setContentsMargins(0, 0, 0, 0)
-        costume_btn_row.setSpacing(6)
+        costume_btn_row.setSpacing(theme.GAP_PAIR)
         self.btn_add = QPushButton("+ カード追加")
-        self.btn_add.setFixedHeight(34)
+        self.btn_add.setFixedHeight(UI_BUTTON_OUTER_HEIGHT)
         self.btn_add.clicked.connect(self._add_costume)
         costume_btn_row.addWidget(self.btn_add)
         self.btn_del = QPushButton("- カード削除")
-        self.btn_del.setFixedHeight(34)
+        self.btn_del.setFixedHeight(UI_BUTTON_OUTER_HEIGHT)
         self.btn_del.clicked.connect(self._del_costume)
         costume_btn_row.addWidget(self.btn_del)
         costume_btn_row.addStretch(1)
@@ -740,7 +730,7 @@ class CharacterTabContent(QWidget):
         det_v.addWidget(lbl_name)
         self.inp_cname = QLineEdit()
         self.inp_cname.setPlaceholderText("省略可")
-        self.inp_cname.setFixedHeight(34)
+        self.inp_cname.setFixedHeight(UI_CONTROL_OUTER_HEIGHT)
         det_v.addWidget(self.inp_cname)
 
         lbl_prompt = QLabel("プロンプト:")
@@ -753,18 +743,18 @@ class CharacterTabContent(QWidget):
         # タグ一覧エリア
         tag_header = QHBoxLayout()
         tag_header.setContentsMargins(0, 0, 0, 0)
-        tag_header.setSpacing(4)
+        tag_header.setSpacing(theme.GAP_PAIR)
         self.tag_editor = TagEditorWidget()
         self.tag_editor.help_label.hide()
         self.tag_editor.tagsChanged.connect(self._on_tags_changed)
-        self.tag_editor.tagClicked.connect(self._on_tag_clicked)
+        self.tag_editor.tagCopied.connect(self._show_copied_tip)
         self.btn_delete_mode = QPushButton("削除モード")
-        self.btn_delete_mode.setFixedHeight(26)
+        self.btn_delete_mode.setFixedHeight(UI_BUTTON_OUTER_HEIGHT)
         self.btn_delete_mode.setMinimumWidth(70)
         self.btn_delete_mode.setCheckable(True)
         self.btn_delete_mode.toggled.connect(self._toggle_delete_mode)
         self.btn_delete_selected = QPushButton("選択削除")
-        self.btn_delete_selected.setFixedHeight(26)
+        self.btn_delete_selected.setFixedHeight(UI_BUTTON_OUTER_HEIGHT)
         self.btn_delete_selected.setMinimumWidth(70)
         self.btn_delete_selected.setVisible(False)
         self.btn_delete_selected.clicked.connect(self._delete_selected_tags)
@@ -801,7 +791,7 @@ class CharacterTabContent(QWidget):
         self.thumb.setFixedSize(self.THUMB_MAX_W, self.THUMB_MAX_W)
         self.thumb.setAlignment(Qt.AlignCenter)
         self.thumb.setStyleSheet(
-            "background:#121a27;border:1px solid #2a3440;border-radius:6px;"
+            f"background:{theme.PANEL_MAIN};border:1px solid {theme.BORDER};border-radius:{theme.RADIUS_CARD}px;"
         )
         g.addWidget(self.thumb, 0, Qt.AlignHCenter)
 
@@ -823,12 +813,12 @@ class CharacterTabContent(QWidget):
         g.addWidget(self.chk_use_random_wc)
 
         self._btn_gen = QPushButton("サムネイル生成")
-        self._btn_gen.setFixedHeight(36)
+        self._btn_gen.setFixedHeight(UI_BUTTON_OUTER_HEIGHT)
         self._btn_gen.clicked.connect(self._gen_thumb)
         g.addWidget(self._btn_gen)
 
         self._btn_gen_all = QPushButton("すべて作成")
-        self._btn_gen_all.setFixedHeight(36)
+        self._btn_gen_all.setFixedHeight(UI_BUTTON_OUTER_HEIGHT)
         self._btn_gen_all.clicked.connect(self._gen_all_thumbs)
         g.addWidget(self._btn_gen_all)
 
@@ -840,14 +830,16 @@ class CharacterTabContent(QWidget):
             brow.setContentsMargins(0, 0, 0, 0)
             brow.setSpacing(8)
             btn_c = QPushButton("キャンセル")
-            btn_c.setFixedHeight(36)
+            btn_c.setFixedHeight(theme.BUTTON_HEIGHT)
             btn_c.setMinimumWidth(80)
+            btn_c.setStyleSheet(theme.button("secondary"))
             if self._dlg_on_cancel is not None:
                 btn_c.clicked.connect(self._dlg_on_cancel)
             brow.addWidget(btn_c)
             btn_ok = QPushButton("作成")
-            btn_ok.setFixedHeight(36)
+            btn_ok.setFixedHeight(theme.BUTTON_HEIGHT)
             btn_ok.setMinimumWidth(80)
+            btn_ok.setStyleSheet(theme.button("primary"))
             btn_ok.clicked.connect(self._dlg_on_create)
             brow.addWidget(btn_ok)
             g.addLayout(brow)
@@ -1045,14 +1037,12 @@ class CharacterTabContent(QWidget):
     def _toggle_delete_mode(self, checked: bool):
         if checked:
             self.tag_editor.set_editable(True)
-            self.btn_delete_mode.setStyleSheet(
-                "QPushButton { background: #8b2020; color: #ffcccc; border: 1px solid #cc4444; border-radius: 4px; }"
-            )
+            self.btn_delete_mode.setStyleSheet(theme.danger_button())
             self.tag_editor.border_frame.setStyleSheet(
                 "#tagBorderFrame {"
-                " background: #1a1015;"
-                f" border: {self.tag_editor._BORDER_WIDTH}px solid #cc4444;"
-                " border-radius: 8px;"
+                f" background: {theme.DANGER_BG};"
+                f" border: {self.tag_editor._BORDER_WIDTH}px solid {theme.DANGER};"
+                f" border-radius: {theme.RADIUS_PANEL}px;"
                 "}"
             )
             self.btn_delete_selected.setVisible(True)
@@ -1061,9 +1051,9 @@ class CharacterTabContent(QWidget):
             self.btn_delete_mode.setStyleSheet("")
             self.tag_editor.border_frame.setStyleSheet(
                 "#tagBorderFrame {"
-                " background: #121a27;"
-                f" border: {self.tag_editor._BORDER_WIDTH}px solid #2f5274;"
-                " border-radius: 8px;"
+                f" background: {theme.PANEL_MAIN};"
+                f" border: {self.tag_editor._BORDER_WIDTH}px solid {theme.BORDER};"
+                f" border-radius: {theme.RADIUS_PANEL}px;"
                 "}"
             )
             self.btn_delete_selected.setVisible(False)
@@ -1080,14 +1070,13 @@ class CharacterTabContent(QWidget):
         # 削除モード中は常に「選択削除」ボタンを表示
         pass
 
-    def _on_tag_clicked(self, tag: str):
-        if not self.tag_editor._select_mode:
-            from PySide6.QtWidgets import QApplication, QToolTip
-            from PySide6.QtGui import QCursor
-            clipboard = QApplication.clipboard()
-            if clipboard:
-                clipboard.setText(tag)
-                QToolTip.showText(QCursor.pos(), f"コピー: {tag}", self)
+    def _show_copied_tip(self, tag: str) -> None:
+        # ベースの TagEditorWidget はコピー完了を tagCopied で通知するだけ。
+        # 表示フィードバックは所有者側の方針で、このダイアログは QToolTip（3秒）を使う
+        from PySide6.QtCore import QRect
+        from PySide6.QtGui import QCursor
+        from PySide6.QtWidgets import QToolTip
+        QToolTip.showText(QCursor.pos(), f"コピー: {tag}", self.tag_editor, QRect(), 3000)
 
     # ── サムネイル ──────────────────────────────────────────────
 
@@ -1105,7 +1094,7 @@ class CharacterTabContent(QWidget):
         self.thumb.setFixedSize(px.size())
         self.thumb.setPixmap(px)
         self.thumb.setStyleSheet(
-            "background:#121a27;border:1px solid #2a3440;border-radius:6px;"
+            f"background:{theme.PANEL_MAIN};border:1px solid {theme.BORDER};border-radius:{theme.RADIUS_CARD}px;"
         )
         self.thumb.setToolTip("クリックして別の画像に変更できます")
 
@@ -1114,7 +1103,7 @@ class CharacterTabContent(QWidget):
         self.thumb.setPixmap(QPixmap())
         self.thumb.setText("")
         self.thumb.setStyleSheet(
-            "background:#121a27;border:1px solid #2a3440;border-radius:6px;"
+            f"background:{theme.PANEL_MAIN};border:1px solid {theme.BORDER};border-radius:{theme.RADIUS_CARD}px;"
         )
 
     def _start_thumb_loading_animation(self, message: str = "サムネイル生成中..."):
@@ -1131,7 +1120,8 @@ class CharacterTabContent(QWidget):
         frame = self._thumb_loading_frames[self._thumb_loading_frame % len(self._thumb_loading_frames)]
         self._thumb_loading_frame += 1
         self.thumb.setStyleSheet(
-            "background:#121a27;border:1px solid #2a3440;border-radius:6px;color:#edf2f7;font-size:12px;"
+            f"background:{theme.PANEL_MAIN};border:1px solid {theme.BORDER};"
+            f"border-radius:{theme.RADIUS_CARD}px;color:{theme.TEXT};font-size:{theme.FONT_SIZE}px;"
         )
         self.thumb.setText(f"{frame}\n{message}")
 
@@ -1482,27 +1472,29 @@ class NewWildcardDialog(QDialog):
         self._build()
 
     def _apply_style(self):
-        self.setStyleSheet("""
-            QDialog{background:#0f1216;color:#edf2f7}
-            QLabel{color:#edf2f7;font-size:12px;background:transparent;border:none}
-            QLineEdit,QPlainTextEdit,QComboBox{background:#161b22;border:1px solid #2a3440;border-radius:4px;color:#edf2f7;padding:4px 8px;font-size:12px}
-            QGroupBox{border:1px solid #2a3440;border-radius:4px;margin-top:4px;color:#edf2f7;font-weight:600;font-size:14px}
-            QGroupBox::title{subcontrol-origin:margin;left:8px;padding:0 4px}
-            QPushButton{background:#2e5fb8;border:1px solid #2e5fb8;border-radius:4px;color:white;padding:0 10px;font-size:12px}
-            QPushButton:hover{background:#3a71c6;border-color:#3a71c6}
-            QPushButton:pressed{background:#1e4a9a;border-color:#1e4a9a}
-            QListWidget{background:#161b22;border:1px solid #2a3440;border-radius:4px;color:#edf2f7;font-size:12px}
-            QListWidget{font-size:13px}
-            QListWidget::item{padding:4px 8px}
-            QListWidget::item:selected{background:#2e5fb8}
-            QListWidget::item:hover{background:#1d2630}
-            QScrollArea{background:transparent;border:none}
-            QSplitter::handle{background:#2a3440}
-            QTabWidget::pane{border:0;margin:0;padding:0}
-            QRadioButton{color:#edf2f7;font-size:11px;spacing:6px}
-            QRadioButton::indicator{width:14px;height:14px;border:2px solid #4a5568;border-radius:8px;background:#161b22}
-            QRadioButton::indicator:checked{border-color:#2e5fb8;background:#2e5fb8}
-            QRadioButton::indicator:hover{border-color:#3a71c6}
+        # 基底は app_style()（app.py で適用済み）に任せ、ここでは差分だけ持つ。
+        # 全面シートを持たせるとウィンドウ/app のルールより優先されて
+        # 部品 styles が打ち消されるため、app_style に無い項目に限定する。
+        self.setStyleSheet(f"""
+            QListWidget::item {{ padding: 4px 8px; }}
+            QTabWidget::pane {{ border: 0; margin: 0; padding: 0; }}
+            QRadioButton {{
+                color: {theme.TEXT};
+                font-size: {theme.SMALL_SIZE + 1}px;
+                spacing: 6px;
+            }}
+            QRadioButton::indicator {{
+                width: {theme.CHECKBOX_SIZE}px;
+                height: {theme.CHECKBOX_SIZE}px;
+                border: 1px solid {theme.BORDER};
+                border-radius: {theme.CHECKBOX_SIZE // 2}px;
+                background: {theme.PANEL_MAIN};
+            }}
+            QRadioButton::indicator:checked {{
+                border: 1px solid {theme.ACCENT};
+                background: {theme.ACCENT};
+            }}
+            QRadioButton::indicator:hover {{ border-color: {theme.ACCENT_HOVER}; }}
         """)
 
     def _tab_footer_callbacks(self):
@@ -1586,8 +1578,9 @@ class NewWildcardDialog(QDialog):
         self._json_overlay = QLabel("📄 画像(.png/.jpg/.webp) または JSON(.json) をドロップしてインポート", self)
         self._json_overlay.setAlignment(Qt.AlignCenter)
         self._json_overlay.setStyleSheet(
-            "background:rgba(30,60,120,0.88);color:#7eb8f7;font-size:18px;"
-            "font-weight:700;border:3px dashed #4a90d9;border-radius:12px;padding:8px"
+            f"background:rgba(37,76,124,0.88);color:{theme.ACCENT_HOVER};font-size:18px;"
+            f"font-weight:700;border:3px dashed {theme.ACCENT};"
+            f"border-radius:{theme.RADIUS_PANEL}px;padding:8px"
         )
         self._json_overlay.hide()
 
@@ -1709,8 +1702,8 @@ class NewWildcardDialog(QDialog):
         self._toast = toast
         toast.setWordWrap(True)
         toast.setStyleSheet(
-            "background:#1f2a37;color:#e6edf3;border:1px solid #3a4654;"
-            "border-radius:8px;padding:10px 16px;font-size:13px;"
+            f"background:{theme.PANEL_MAIN};color:{theme.TEXT};border:1px solid {theme.BORDER};"
+            f"border-radius:{theme.RADIUS_PANEL}px;padding:10px 16px;font-size:{theme.FONT_SIZE}px;"
         )
         toast.setAlignment(Qt.AlignCenter)
         max_w = max(200, self.width() - 48)
@@ -1849,8 +1842,8 @@ class NewWildcardDialog(QDialog):
         plus_label = QLabel("+")
         plus_label.setAlignment(Qt.AlignCenter)
         plus_label.setStyleSheet(
-            "QLabel{color:#6a7a8a;font-size:16px;font-weight:700;padding:4px 12px}"
-            "QLabel:hover{color:#edf2f7}"
+            f"QLabel{{color:{theme.TEXT_MUTED};font-size:16px;font-weight:700;padding:4px 12px}}"
+            f"QLabel:hover{{color:{theme.TEXT}}}"
         )
         plus_label.setFixedWidth(40)
         plus_idx = self.tabs.addTab(plus_label, "+")

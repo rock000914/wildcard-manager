@@ -139,6 +139,73 @@ def ensure_thumbnail_destination(thumbnail_root: Path, rel_path: str) -> Path:
     return thumbnail_root / rel.parent / f"{rel.stem}.preview.webp"
 
 
+# 2枚目以降のサムネイル（カードをダブルクリックでめくる機能）のファイル名は
+# ``{stem}.g2.webp`` 形式。区切りを ``.`` にしているのは、このライブラリの
+# ワイルドカード名が ``_`` 区切り（例: mari_hyper_v2）で非常に多く、
+# ``{stem}_2`` だと別カード（``foo_2.txt``）の1枚目と実パス衝突する為。
+GALLERY_MARKER = ".g"
+GALLERY_MIN_INDEX = 2
+
+
+def thumbnail_folder_listing(thumbnail_root: Path, rel_path: str | Path) -> list[str]:
+    """このカードのサムネイルが入っているフォルダのファイル名一覧。"""
+    folder = thumbnail_root / Path(rel_path).parent
+    try:
+        with os.scandir(folder) as entries:
+            return [de.name for de in entries if de.is_file()]
+    except OSError:
+        return []
+
+
+_EXT_ALT = "|".join(re.escape(ext[1:]) for ext in THUMBNAIL_EXTENSIONS)
+_PREVIEW_NAME_RE = re.compile(rf"^(?P<stem>.+)\.preview\.(?P<ext>{_EXT_ALT})$", re.IGNORECASE)
+_PLAIN_NAME_RE = re.compile(rf"^(?P<stem>.+)\.(?P<ext>{_EXT_ALT})$", re.IGNORECASE)
+_GALLERY_NAME_RE = re.compile(rf"^(?P<stem>.+){re.escape(GALLERY_MARKER)}(?P<index>\d+)\.(?P<ext>{_EXT_ALT})$", re.IGNORECASE)
+
+
+def build_thumbnail_gallery_index(names: list[str]) -> dict[str, list[str]]:
+    """フォルダのファイル名一覧から ``カードstem -> 画像名列`` の索引を作る。
+
+    列の順は 1枚目（``{stem}.preview.*`` → ``{stem}.*``）→ 2枚目以降（``{stem}.g2.*`` …）。
+    フォルダ単位で1回だけ作って全カードで使い回す（可視カード分の走査だと
+    1フォルダ数千ファイル × 36枚で Path 生成が効いて初描画が重くなる）。
+
+    ``foo.g2.webp`` は ``foo`` の2枚目であると同時に ``foo.g2.txt`` の1枚目でも
+    あれるが、1枚目解決（DB側の `_thumbnail_candidates`）は従来通り優先するので
+    両方に載せても表示は壊れない。
+    """
+    ranked: dict[str, list[tuple[int, int, str]]] = {}
+    for order, name in enumerate(names):
+        preview = _PREVIEW_NAME_RE.match(name)
+        if preview:
+            ranked.setdefault(preview.group("stem"), []).append((0, order, name))
+            continue
+        gallery = _GALLERY_NAME_RE.match(name)
+        if gallery and int(gallery.group("index")) >= GALLERY_MIN_INDEX:
+            ranked.setdefault(gallery.group("stem"), []).append(
+                (1000 + int(gallery.group("index")), order, name))
+            continue
+        plain = _PLAIN_NAME_RE.match(name)
+        if plain:
+            ranked.setdefault(plain.group("stem"), []).append((1, order, name))
+    return {
+        stem: [name for _rank, _order, name in sorted(items)]
+        for stem, items in ranked.items()
+    }
+
+
+def next_gallery_slot(thumbnail_root: Path, rel_path: str | Path) -> Path:
+    """2枚目以降の次の空きスロット（``{stem}.g{N}.webp``）を返す。"""
+    rel = Path(rel_path)
+    folder = thumbnail_root / rel.parent
+    index = GALLERY_MIN_INDEX
+    while True:
+        candidate = folder / f"{rel.stem}{GALLERY_MARKER}{index}.webp"
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
 CONFLICT_POLICIES = {
     "overwrite": "常に上書き",
     "keep_existing": "既存を残す",
